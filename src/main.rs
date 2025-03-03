@@ -50,18 +50,13 @@ fn main() {
 
     let mut outfile = File::create("out.mmts").unwrap();
 
-    let mut buffer: Vec<u8> = vec![];
     let mut current_stream = 0;
     let mut ts_packet = vec![0; 188];
-    loop {
-        // let stream = streams[current_stream];
-        match streams[current_stream].file.read_exact(&mut ts_packet) {
-            Ok(_) => {}
-            Err(_) => {
-                // TOOD: eof
-                break;
-            }
-        };
+    while streams[current_stream]
+        .file
+        .read_exact(&mut ts_packet)
+        .is_ok()
+    {
         let packet: [u8; 188] = ts_packet[..].try_into().unwrap();
         let packet = TSPacket::from(packet);
         match packet.pid {
