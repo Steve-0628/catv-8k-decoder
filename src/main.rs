@@ -1,8 +1,11 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
+    env,
     fs::File,
-    io::{Read, Seek, SeekFrom, Write},
+    io::{self, BufReader, Read, Seek, SeekFrom, Write},
     path::PathBuf,
+    sync::mpsc,
+    thread,
 };
 
 const TS_PACKET_SIZE: usize = 188;
@@ -11,25 +14,50 @@ const DATA_SLOTS_PER_TSMF: usize = 52;
 const PID_EXTENDED_TSMF_HEADER: u16 = 0x002f;
 const PID_SPLIT_TLV: u16 = 0x002d;
 
-// あなたの環境では RSN 1 が本命だった
 const TARGET_RSN: u8 = 1;
-
-// 256QAMなら基本4
 const EXPECTED_NUMBER_OF_FRAMES: usize = 4;
 
-// fp=0候補をどれだけ集めるか。
-// 1000 superframe ≒ 6秒くらいだったなら、1800は約10秒強相当。
 const FP0_CANDIDATES_TO_SCAN: usize = 1800;
-
-// 出力を途中で止めたいなら Some(n)
 const LIMIT_OUTPUT_SUPERFRAMES: Option<u64> = None;
 
 const BASE_INDEX: usize = 12;
 const MAX_SHIFT: isize = 16;
 const FAST_TEST_SUPERFRAMES: usize = 8;
-const PAYLOAD_START: usize = 3; // 映像が出ていた方にする。4で出たなら4。
+const PAYLOAD_START: usize = 3;
+
+// live用。まず各入力で fp=0 をこの数だけ貯めてから同期探索する。
+const LIVE_FP0_CANDIDATES_TO_BUFFER: usize = 64;
+const LIVE_BAD_RESYNC_THRESHOLD: u64 = 200;
 
 fn main() {
+    let args: Vec<String> = env::args().collect();
+
+    if args.len() >= 2 && args[1] == "--live" {
+        if args.len() != 5 {
+            eprintln!("usage:");
+            eprintln!("  file mode: cargo run --release");
+            eprintln!("  live mode: cargo run --release -- --live <ts1|url1> <ts2|url2> <ts3|url3>");
+            std::process::exit(1);
+        }
+
+        let inputs = vec![
+            args[2].clone(),
+            args[3].clone(),
+            args[4].clone(),
+        ];
+
+        run_live_mode(inputs);
+    } else {
+        run_file_mode();
+    }
+}
+
+/* ============================================================
+ * file mode
+ * ============================================================
+ */
+
+fn run_file_mode() {
     let mut paths: Vec<PathBuf> = std::fs::read_dir("./in")
         .unwrap()
         .map(|p| p.unwrap().path())
@@ -41,6 +69,7 @@ fn main() {
         panic!("最低3波分のTSファイルが必要です。./in/ に3ファイル置いてください");
     }
 
+    eprintln!("file mode");
     eprintln!("input files:");
     for p in &paths {
         eprintln!("  {:?}", p);
@@ -59,7 +88,6 @@ fn main() {
         }
     }
 
-    // carrier_sequence順に並べる
     candidate_lists.sort_by_key(|list| list[0].carrier_sequence);
 
     eprintln!("candidate summary:");
@@ -76,7 +104,7 @@ fn main() {
         );
     }
 
-    let best = find_best_sync(&candidate_lists);
+    let best = find_best_file_sync(&candidate_lists);
 
     eprintln!("best sync:");
     eprintln!("  score={}", best.score);
@@ -92,28 +120,30 @@ fn main() {
 
     eprintln!("writing output from best sync...");
 
-    let mut streams: Vec<StreamState> = best
+    let mut streams: Vec<FileStreamState> = best
         .indices
         .iter()
         .enumerate()
         .map(|(stream_idx, candidate_idx)| {
             let c = &candidate_lists[stream_idx][*candidate_idx];
-            open_stream_at_candidate(c)
+            open_file_stream_at_candidate(c)
         })
         .collect();
 
     streams.sort_by_key(|s| s.carrier_sequence);
 
-    let mut out = TlvReassembler::new(best.payload_start, Some(File::create("out_rsn_01.mmts").unwrap()));
+    let out_file = File::create("out_rsn_01.mmts").unwrap();
+    let mut out = TlvReassembler::new(best.payload_start, Some(Box::new(out_file)));
 
     let mut superframe_count = 0u64;
 
     loop {
-        let ok = process_one_superframe(&mut streams, &mut out, TARGET_RSN);
+        let frames = match read_one_superframe_from_files(&mut streams) {
+            Some(frames) => frames,
+            None => break,
+        };
 
-        if !ok {
-            break;
-        }
+        process_superframe_frames(frames, &mut out, TARGET_RSN);
 
         superframe_count += 1;
 
@@ -156,20 +186,20 @@ struct TrialResult {
     stats: TlvStats,
 }
 
-fn find_best_sync(candidate_lists: &[Vec<SyncCandidate>]) -> TrialResult {
+fn find_best_file_sync(candidate_lists: &[Vec<SyncCandidate>]) -> TrialResult {
     if candidate_lists.len() != 3 {
         panic!("この版は3波前提です");
     }
 
     for (i, list) in candidate_lists.iter().enumerate() {
-        // if list.len() <= BASE_INDEX {
-        //     panic!(
-        //         "stream {} の候補数が足りません: candidates={} BASE_INDEX={}",
-        //         i,
-        //         list.len(),
-        //         BASE_INDEX
-        //     );
-        // }
+        if list.len() <= BASE_INDEX {
+            panic!(
+                "stream {} の候補数が足りません: candidates={} BASE_INDEX={}",
+                i,
+                list.len(),
+                BASE_INDEX
+            );
+        }
     }
 
     let mut results = Vec::new();
@@ -200,12 +230,9 @@ fn find_best_sync(candidate_lists: &[Vec<SyncCandidate>]) -> TrialResult {
                 continue;
             }
 
-            if let Some(result) = run_trial(
-                candidate_lists,
-                &indices,
-                PAYLOAD_START,
-                FAST_TEST_SUPERFRAMES,
-            ) {
+            if let Some(result) =
+                run_file_trial(candidate_lists, &indices, PAYLOAD_START, FAST_TEST_SUPERFRAMES)
+            {
                 results.push(result);
             }
         }
@@ -227,18 +254,19 @@ fn find_best_sync(candidate_lists: &[Vec<SyncCandidate>]) -> TrialResult {
 
     results[0].clone()
 }
-fn run_trial(
+
+fn run_file_trial(
     candidate_lists: &[Vec<SyncCandidate>],
     indices: &[usize],
     payload_start: usize,
     test_superframes: usize,
 ) -> Option<TrialResult> {
-    let mut streams: Vec<StreamState> = indices
+    let mut streams: Vec<FileStreamState> = indices
         .iter()
         .enumerate()
         .map(|(stream_idx, candidate_idx)| {
             let c = &candidate_lists[stream_idx][*candidate_idx];
-            open_stream_at_candidate(c)
+            open_file_stream_at_candidate(c)
         })
         .collect();
 
@@ -249,15 +277,16 @@ fn run_trial(
     let mut ok_superframes = 0usize;
 
     for _ in 0..test_superframes {
-        if !process_one_superframe(&mut streams, &mut reassembler, TARGET_RSN) {
-            break;
-        }
+        let frames = match read_one_superframe_from_files(&mut streams) {
+            Some(frames) => frames,
+            None => break,
+        };
+
+        process_superframe_frames(frames, &mut reassembler, TARGET_RSN);
 
         ok_superframes += 1;
 
         let st = reassembler.stats();
-
-        // 明らかなハズレは即打ち切り
         if st.bad > 20 || st.resync > 20 {
             break;
         }
@@ -277,6 +306,7 @@ fn run_trial(
         stats,
     })
 }
+
 fn score_stats(stats: &TlvStats, ok_superframes: usize) -> i128 {
     let mut score = 0i128;
 
@@ -337,11 +367,21 @@ fn scan_fp0_candidates(path: &PathBuf, max_candidates: usize) -> Vec<SyncCandida
     candidates
 }
 
-fn open_stream_at_candidate(candidate: &SyncCandidate) -> StreamState {
+#[derive(Debug)]
+struct FileStreamState {
+    path: PathBuf,
+    file: File,
+    offset: u64,
+    carrier_sequence: u8,
+    number_of_carriers: u8,
+    number_of_frames: u8,
+}
+
+fn open_file_stream_at_candidate(candidate: &SyncCandidate) -> FileStreamState {
     let mut file = File::open(&candidate.path).unwrap();
     file.seek(SeekFrom::Start(candidate.offset)).unwrap();
 
-    StreamState {
+    FileStreamState {
         path: candidate.path.clone(),
         file,
         offset: candidate.offset,
@@ -351,17 +391,13 @@ fn open_stream_at_candidate(candidate: &SyncCandidate) -> StreamState {
     }
 }
 
-fn process_one_superframe(
-    streams: &mut [StreamState],
-    reassembler: &mut TlvReassembler,
-    target_rsn: u8,
-) -> bool {
+fn read_one_superframe_from_files(streams: &mut [FileStreamState]) -> Option<Vec<Vec<TsmfFrame>>> {
     let n_carriers = streams.len();
     let n_frames = streams[0].number_of_frames as usize;
 
     if n_frames != EXPECTED_NUMBER_OF_FRAMES {
         eprintln!("unexpected number_of_frames={}", n_frames);
-        return false;
+        return None;
     }
 
     let mut superframe: Vec<Vec<TsmfFrame>> = (0..n_frames)
@@ -370,9 +406,9 @@ fn process_one_superframe(
 
     for stream in streams.iter_mut() {
         for _ in 0..n_frames {
-            let frame = match read_one_tsmf_frame(stream) {
+            let frame = match read_one_tsmf_frame_from_file(stream) {
                 Some(f) => f,
-                None => return false,
+                None => return None,
             };
 
             let fp = frame.header.frame_position as usize;
@@ -383,92 +419,17 @@ fn process_one_superframe(
                     frame.header.frame_position,
                     frame.header.carrier_sequence
                 );
-                return false;
+                return None;
             }
 
             superframe[fp].push(frame);
         }
     }
 
-    for fp in 0..n_frames {
-        superframe[fp].sort_by_key(|f| f.header.carrier_sequence);
-
-        if superframe[fp].len() != n_carriers {
-            eprintln!(
-                "missing carriers at fp={} got={} expected={}",
-                fp,
-                superframe[fp].len(),
-                n_carriers
-            );
-            return false;
-        }
-    }
-
-    let mut ordered_slots = Vec::new();
-
-    for fp in 0..n_frames {
-        for carrier_idx in 0..n_carriers {
-            let frame = &superframe[fp][carrier_idx];
-
-            for data_slot_idx in 0..DATA_SLOTS_PER_TSMF {
-                let rsn = frame.header.relative_stream_number[data_slot_idx];
-
-                if rsn != target_rsn {
-                    continue;
-                }
-
-                let rsn_idx = (rsn - 1) as usize;
-
-                if rsn_idx >= frame.header.stream_type.len() {
-                    continue;
-                }
-
-                if frame.header.stream_type[rsn_idx] != StreamKind::Tlv {
-                    continue;
-                }
-
-                /*
-                 * 仕様の合成順:
-                 *   subframe
-                 *     slot_position
-                 *       carrier_sequence
-                 *
-                 * 拡張TSMFは 53 slots。
-                 * slot 0 はヘッダ。
-                 * data_slot_idx 0 は slot 1 に相当。
-                 */
-                let slot_index_in_tsmf = data_slot_idx + 1;
-                let full_slot_index = fp * 53 + slot_index_in_tsmf;
-
-                let subframe = full_slot_index / n_frames;
-                let slot_position = full_slot_index % n_frames;
-
-                ordered_slots.push(OrderedSlot {
-                    subframe,
-                    slot_position,
-                    carrier_sequence: frame.header.carrier_sequence,
-                    packet: frame.slots[data_slot_idx],
-                });
-            }
-        }
-    }
-
-    ordered_slots.sort_by_key(|s| {
-        (
-            s.subframe,
-            s.slot_position,
-            s.carrier_sequence,
-        )
-    });
-
-    for slot in ordered_slots {
-        reassembler.feed_split_tlv_packet(&slot.packet);
-    }
-
-    true
+    normalize_superframe(superframe, n_carriers)
 }
 
-fn read_one_tsmf_frame(stream: &mut StreamState) -> Option<TsmfFrame> {
+fn read_one_tsmf_frame_from_file(stream: &mut FileStreamState) -> Option<TsmfFrame> {
     let mut buf = [0u8; TS_PACKET_SIZE];
 
     let header = loop {
@@ -538,6 +499,631 @@ fn read_one_tsmf_frame(stream: &mut StreamState) -> Option<TsmfFrame> {
     Some(TsmfFrame { header, slots })
 }
 
+/* ============================================================
+ * live mode
+ * ============================================================
+ */
+
+fn run_live_mode(inputs: Vec<String>) {
+    eprintln!("live mode");
+    eprintln!("input streams:");
+    for input in &inputs {
+        eprintln!("  {}", input);
+    }
+
+    let (tx, rx) = mpsc::channel::<LiveMessage>();
+
+    for (source_idx, input) in inputs.iter().cloned().enumerate() {
+        let tx = tx.clone();
+
+        thread::spawn(move || {
+            let reader = open_live_input(&input).unwrap_or_else(|e| {
+                panic!("failed to open live input {}: {}", input, e);
+            });
+
+            let reader = BufReader::with_capacity(188 * 8192, reader);
+            let mut frame_reader = LiveFrameReader::new(source_idx, input.clone(), reader);
+
+            loop {
+                match frame_reader.read_one_frame() {
+                    Some(frame) => {
+                        if tx.send(LiveMessage { source_idx, frame }).is_err() {
+                            break;
+                        }
+                    }
+                    None => {
+                        eprintln!("live reader ended: source_idx={} input={}", source_idx, input);
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    drop(tx);
+
+
+    let mut buffers: Vec<LiveBuffer> = inputs
+        .iter()
+        .enumerate()
+        .map(|(source_idx, input)| LiveBuffer {
+            source_idx,
+            name: input.clone(),
+            carrier_sequence: None,
+            frames: VecDeque::new(),
+        })
+        .collect();
+
+    eprintln!(
+        "buffering live input until each stream has {} fp=0 candidates...",
+        LIVE_FP0_CANDIDATES_TO_BUFFER
+    );
+
+    while !live_buffers_ready(&buffers, LIVE_FP0_CANDIDATES_TO_BUFFER) {
+        recv_live_frame_into_buffers(&rx, &mut buffers);
+    }
+
+    for b in &mut buffers {
+        if let Some(frame) = b.frames.front() {
+            b.carrier_sequence = Some(frame.header.carrier_sequence);
+        }
+    }
+
+    buffers.sort_by_key(|b| b.carrier_sequence.unwrap_or(255));
+
+    eprintln!("live buffer summary:");
+    for b in &buffers {
+        eprintln!(
+            "  source={} carrier={:?} frames={} fp0={}",
+            b.source_idx,
+            b.carrier_sequence,
+            b.frames.len(),
+            count_fp0_in_deque(&b.frames)
+        );
+    }
+
+    let best = find_best_live_sync(&buffers);
+
+    eprintln!("best live sync:");
+    eprintln!("  score={}", best.score);
+    eprintln!("  payload_start={}", best.payload_start);
+    eprintln!("  indices={:?}", best.indices);
+    eprintln!("  stats={:?}", best.stats);
+
+    for (i, idx) in best.indices.iter().enumerate() {
+        eprintln!(
+            "  carrier={:?} source={} start_frame_index={}",
+            buffers[i].carrier_sequence,
+            buffers[i].source_idx,
+            idx
+        );
+    }
+
+    // 採用位置より前を捨てる
+    for (i, idx) in best.indices.iter().enumerate() {
+        for _ in 0..*idx {
+            buffers[i].frames.pop_front();
+        }
+    }
+
+    eprintln!("starting live output to stdout...");
+    eprintln!("note: logs go to stderr, stream goes to stdout");
+
+    let stdout = io::stdout();
+    let mut out = TlvReassembler::new(best.payload_start, Some(Box::new(stdout)));
+
+    let mut superframe_count = 0u64;
+    let mut last_bad = 0u64;
+    let mut last_resync = 0u64;
+
+    loop {
+        while !buffers_have_at_least_frames(&buffers, EXPECTED_NUMBER_OF_FRAMES) {
+            recv_live_frame_into_buffers(&rx, &mut buffers);
+        }
+
+        let frames = pop_one_live_superframe(&mut buffers);
+
+        process_superframe_frames(frames, &mut out, TARGET_RSN);
+
+        superframe_count += 1;
+
+        if superframe_count % 100 == 0 {
+            let st = out.stats();
+
+            eprintln!(
+                "live superframes={} stats={:?}",
+                superframe_count,
+                st
+            );
+
+            let bad_delta = st.bad.saturating_sub(last_bad);
+            let resync_delta = st.resync.saturating_sub(last_resync);
+
+            last_bad = st.bad;
+            last_resync = st.resync;
+
+            if bad_delta > LIVE_BAD_RESYNC_THRESHOLD || resync_delta > LIVE_BAD_RESYNC_THRESHOLD {
+                eprintln!(
+                    "warning: live stream may be out of sync: bad_delta={} resync_delta={}",
+                    bad_delta,
+                    resync_delta
+                );
+                eprintln!("current version only warns; automatic resync can be added next");
+            }
+        }
+    }
+}
+
+fn open_live_input(input: &str) -> io::Result<Box<dyn Read + Send>> {
+    if input.starts_with("http://") || input.starts_with("https://") {
+        let response = ureq::get(input)
+            .header("Connection", "keep-alive")
+            .call()
+            .map_err(|e| io::Error::other(format!("HTTP GET failed: {e}")))?;
+
+        if response.status().as_u16() < 200 || response.status().as_u16() >= 300 {
+            return Err(io::Error::other(
+                format!("HTTP status {}", response.status()),
+            ));
+        }
+
+        Ok(Box::new(response.into_body().into_reader()))
+    } else {
+        let file = File::open(input)?;
+        Ok(Box::new(file))
+    }
+}
+
+#[derive(Debug)]
+struct LiveMessage {
+    source_idx: usize,
+    frame: TsmfFrame,
+}
+
+#[derive(Debug)]
+struct LiveBuffer {
+    source_idx: usize,
+    name: String,
+    carrier_sequence: Option<u8>,
+    frames: VecDeque<TsmfFrame>,
+}
+
+fn recv_live_frame_into_buffers(rx: &mpsc::Receiver<LiveMessage>, buffers: &mut [LiveBuffer]) {
+    let msg = rx.recv().unwrap_or_else(|_| {
+        panic!("all live reader threads ended");
+    });
+
+    let buf = buffers
+        .iter_mut()
+        .find(|b| b.source_idx == msg.source_idx)
+        .unwrap();
+
+    if buf.carrier_sequence.is_none() {
+        buf.carrier_sequence = Some(msg.frame.header.carrier_sequence);
+    }
+
+    buf.frames.push_back(msg.frame);
+}
+
+fn live_buffers_ready(buffers: &[LiveBuffer], min_fp0: usize) -> bool {
+    buffers
+        .iter()
+        .all(|b| count_fp0_in_deque(&b.frames) >= min_fp0)
+}
+
+fn count_fp0_in_deque(frames: &VecDeque<TsmfFrame>) -> usize {
+    frames
+        .iter()
+        .filter(|f| f.header.frame_position == 0)
+        .count()
+}
+
+fn buffers_have_at_least_frames(buffers: &[LiveBuffer], n: usize) -> bool {
+    buffers.iter().all(|b| b.frames.len() >= n)
+}
+
+fn pop_one_live_superframe(buffers: &mut [LiveBuffer]) -> Vec<Vec<TsmfFrame>> {
+    let n_carriers = buffers.len();
+    let n_frames = EXPECTED_NUMBER_OF_FRAMES;
+
+    let mut superframe: Vec<Vec<TsmfFrame>> = (0..n_frames)
+        .map(|_| Vec::with_capacity(n_carriers))
+        .collect();
+
+    for b in buffers.iter_mut() {
+        for _ in 0..n_frames {
+            let frame = b.frames.pop_front().unwrap();
+            let fp = frame.header.frame_position as usize;
+
+            if fp < n_frames {
+                superframe[fp].push(frame);
+            } else {
+                eprintln!(
+                    "live invalid frame_position={} carrier={}",
+                    frame.header.frame_position,
+                    frame.header.carrier_sequence
+                );
+            }
+        }
+    }
+
+    normalize_superframe(superframe, n_carriers).unwrap_or_else(|| {
+        panic!("live superframe normalization failed");
+    })
+}
+
+#[derive(Debug, Clone)]
+struct LiveTrialResult {
+    score: i128,
+    payload_start: usize,
+    indices: Vec<usize>,
+    stats: TlvStats,
+}
+
+fn find_best_live_sync(buffers: &[LiveBuffer]) -> LiveTrialResult {
+    if buffers.len() != 3 {
+        panic!("live sync search is currently 3-carrier only");
+    }
+
+    let fp0_lists: Vec<Vec<usize>> = buffers
+        .iter()
+        .map(|b| collect_fp0_indices_from_deque(&b.frames))
+        .collect();
+
+    for (i, list) in fp0_lists.iter().enumerate() {
+        if list.len() <= BASE_INDEX {
+            panic!(
+                "live stream {} has too few fp0 candidates: {}",
+                i,
+                list.len()
+            );
+        }
+    }
+
+    let base = BASE_INDEX;
+
+    let mut results = Vec::new();
+
+    eprintln!(
+        "live sync search: base fp0 candidate={} carrier1 fixed, carrier2/3 shift={}..{} payload_start={}",
+        BASE_INDEX,
+        -MAX_SHIFT,
+        MAX_SHIFT,
+        PAYLOAD_START
+    );
+
+    for s2 in -MAX_SHIFT..=MAX_SHIFT {
+        for s3 in -MAX_SHIFT..=MAX_SHIFT {
+            let c0 = base as isize;
+            let c1 = base as isize + s2;
+            let c2 = base as isize + s3;
+
+            if c1 < 0 || c2 < 0 {
+                continue;
+            }
+
+            let c0 = c0 as usize;
+            let c1 = c1 as usize;
+            let c2 = c2 as usize;
+
+            if c1 >= fp0_lists[1].len() || c2 >= fp0_lists[2].len() {
+                continue;
+            }
+
+            let indices = vec![fp0_lists[0][c0], fp0_lists[1][c1], fp0_lists[2][c2]];
+
+            if let Some(result) =
+                run_live_trial(buffers, &indices, PAYLOAD_START, FAST_TEST_SUPERFRAMES)
+            {
+                results.push(result);
+            }
+        }
+    }
+
+    if results.is_empty() {
+        panic!("no live sync candidate found");
+    }
+
+    results.sort_by_key(|r| r.score);
+
+    eprintln!("live sync top:");
+    for r in results.iter().take(20) {
+        eprintln!(
+            "  score={} indices={:?} stats={:?}",
+            r.score, r.indices, r.stats
+        );
+    }
+
+    results[0].clone()
+}
+
+fn collect_fp0_indices_from_deque(frames: &VecDeque<TsmfFrame>) -> Vec<usize> {
+    frames
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, f)| {
+            if f.header.frame_position == 0 {
+                Some(idx)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn run_live_trial(
+    buffers: &[LiveBuffer],
+    start_indices: &[usize],
+    payload_start: usize,
+    test_superframes: usize,
+) -> Option<LiveTrialResult> {
+    let mut reassembler = TlvReassembler::new(payload_start, None);
+    let mut ok_superframes = 0usize;
+
+    for sf in 0..test_superframes {
+        let frames = match get_superframe_from_live_buffers(buffers, start_indices, sf) {
+            Some(frames) => frames,
+            None => break,
+        };
+
+        process_superframe_frames(frames, &mut reassembler, TARGET_RSN);
+
+        ok_superframes += 1;
+
+        let st = reassembler.stats();
+        if st.bad > 20 || st.resync > 20 {
+            break;
+        }
+    }
+
+    if ok_superframes == 0 {
+        return None;
+    }
+
+    let stats = reassembler.stats();
+    let score = score_stats(&stats, ok_superframes);
+
+    Some(LiveTrialResult {
+        score,
+        payload_start,
+        indices: start_indices.to_vec(),
+        stats,
+    })
+}
+
+fn get_superframe_from_live_buffers(
+    buffers: &[LiveBuffer],
+    start_indices: &[usize],
+    superframe_offset: usize,
+) -> Option<Vec<Vec<TsmfFrame>>> {
+    let n_carriers = buffers.len();
+    let n_frames = EXPECTED_NUMBER_OF_FRAMES;
+
+    let mut superframe: Vec<Vec<TsmfFrame>> = (0..n_frames)
+        .map(|_| Vec::with_capacity(n_carriers))
+        .collect();
+
+    for carrier_idx in 0..n_carriers {
+        let start = start_indices[carrier_idx] + superframe_offset * n_frames;
+
+        if start + n_frames > buffers[carrier_idx].frames.len() {
+            return None;
+        }
+
+        for j in 0..n_frames {
+            let frame = buffers[carrier_idx].frames[start + j].clone();
+            let fp = frame.header.frame_position as usize;
+
+            if fp >= n_frames {
+                return None;
+            }
+
+            superframe[fp].push(frame);
+        }
+    }
+
+    normalize_superframe(superframe, n_carriers)
+}
+
+struct LiveFrameReader<R: Read> {
+    source_idx: usize,
+    name: String,
+    reader: R,
+    carrier_sequence: Option<u8>,
+    pending_header: Option<ExtendedTsmfHeader>,
+}
+
+impl<R: Read> LiveFrameReader<R> {
+    fn new(source_idx: usize, name: String, reader: R) -> Self {
+        Self {
+            source_idx,
+            name,
+            reader,
+            carrier_sequence: None,
+            pending_header: None,
+        }
+    }
+
+    fn read_one_frame(&mut self) -> Option<TsmfFrame> {
+        let mut buf = [0u8; TS_PACKET_SIZE];
+
+        loop {
+            let header = if let Some(h) = self.pending_header.take() {
+                h
+            } else {
+                loop {
+                    if self.reader.read_exact(&mut buf).is_err() {
+                        return None;
+                    }
+
+                    if packet_pid(&buf) == PID_EXTENDED_TSMF_HEADER {
+                        let h = ExtendedTsmfHeader::parse(&buf);
+
+                        if self.carrier_sequence.is_none() {
+                            self.carrier_sequence = Some(h.carrier_sequence);
+                            eprintln!(
+                                "live reader source={} input={} carrier={}",
+                                self.source_idx,
+                                self.name,
+                                h.carrier_sequence
+                            );
+                        }
+
+                        break h;
+                    }
+                }
+            };
+
+            let mut slots: Vec<[u8; 188]> = Vec::with_capacity(DATA_SLOTS_PER_TSMF);
+
+            while slots.len() < DATA_SLOTS_PER_TSMF {
+                if self.reader.read_exact(&mut buf).is_err() {
+                    return None;
+                }
+
+                match packet_pid(&buf) {
+                    PID_SPLIT_TLV => {
+                        slots.push(buf);
+                    }
+
+                    PID_EXTENDED_TSMF_HEADER => {
+                        let h = ExtendedTsmfHeader::parse(&buf);
+                        eprintln!(
+                            "live warning: next 0x2F came before 52 slots source={} carrier={} fp={} slots={}",
+                            self.source_idx,
+                            header.carrier_sequence,
+                            header.frame_position,
+                            slots.len()
+                        );
+
+                        self.pending_header = Some(h);
+                        break;
+                    }
+
+                    _ => {}
+                }
+            }
+
+            if slots.len() == DATA_SLOTS_PER_TSMF {
+                return Some(TsmfFrame { header, slots });
+            }
+
+            // incomplete frameだったので、pending_headerから次フレームを試す
+        }
+    }
+}
+
+/* ============================================================
+ * shared superframe processing
+ * ============================================================
+ */
+
+fn normalize_superframe(
+    mut superframe: Vec<Vec<TsmfFrame>>,
+    n_carriers: usize,
+) -> Option<Vec<Vec<TsmfFrame>>> {
+    for fp in 0..superframe.len() {
+        superframe[fp].sort_by_key(|f| f.header.carrier_sequence);
+
+        if superframe[fp].len() != n_carriers {
+            eprintln!(
+                "missing carriers at fp={} got={} expected={}",
+                fp,
+                superframe[fp].len(),
+                n_carriers
+            );
+            return None;
+        }
+    }
+
+    Some(superframe)
+}
+
+fn process_superframe_frames(
+    superframe: Vec<Vec<TsmfFrame>>,
+    reassembler: &mut TlvReassembler,
+    target_rsn: u8,
+) {
+    let n_frames = superframe.len();
+
+    if n_frames != EXPECTED_NUMBER_OF_FRAMES {
+        eprintln!("unexpected number_of_frames={}", n_frames);
+        return;
+    }
+
+    let n_carriers = superframe[0].len();
+
+    let mut ordered_slots = Vec::new();
+
+    for fp in 0..n_frames {
+        for carrier_idx in 0..n_carriers {
+            let frame = &superframe[fp][carrier_idx];
+
+            for data_slot_idx in 0..DATA_SLOTS_PER_TSMF {
+                let rsn = frame.header.relative_stream_number[data_slot_idx];
+
+                if rsn != target_rsn {
+                    continue;
+                }
+
+                let rsn_idx = (rsn - 1) as usize;
+
+                if rsn_idx >= frame.header.stream_type.len() {
+                    continue;
+                }
+
+                if frame.header.stream_type[rsn_idx] != StreamKind::Tlv {
+                    continue;
+                }
+
+                let slot_index_in_tsmf = data_slot_idx + 1;
+                let full_slot_index = fp * 53 + slot_index_in_tsmf;
+
+                let subframe = full_slot_index / n_frames;
+                let slot_position = full_slot_index % n_frames;
+
+                ordered_slots.push(OrderedSlot {
+                    subframe,
+                    slot_position,
+                    carrier_sequence: frame.header.carrier_sequence,
+                    packet: frame.slots[data_slot_idx],
+                });
+            }
+        }
+    }
+
+    ordered_slots.sort_by_key(|s| {
+        (
+            s.subframe,
+            s.slot_position,
+            s.carrier_sequence,
+        )
+    });
+
+    for slot in ordered_slots {
+        reassembler.feed_split_tlv_packet(&slot.packet);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TsmfFrame {
+    header: ExtendedTsmfHeader,
+    slots: Vec<[u8; 188]>,
+}
+
+#[derive(Clone, Copy)]
+struct OrderedSlot {
+    subframe: usize,
+    slot_position: usize,
+    carrier_sequence: u8,
+    packet: [u8; 188],
+}
+
+/* ============================================================
+ * packet / TSMF header parser
+ * ============================================================
+ */
+
 fn packet_pid(data: &[u8; 188]) -> u16 {
     if data[0] != 0x47 {
         eprintln!(
@@ -551,30 +1137,6 @@ fn packet_pid(data: &[u8; 188]) -> u16 {
 
 fn packet_start_indicator(data: &[u8; 188]) -> bool {
     (data[1] & 0x40) != 0
-}
-
-#[derive(Debug)]
-struct StreamState {
-    path: PathBuf,
-    file: File,
-    offset: u64,
-    carrier_sequence: u8,
-    number_of_carriers: u8,
-    number_of_frames: u8,
-}
-
-#[derive(Debug)]
-struct TsmfFrame {
-    header: ExtendedTsmfHeader,
-    slots: Vec<[u8; 188]>,
-}
-
-#[derive(Clone, Copy)]
-struct OrderedSlot {
-    subframe: usize,
-    slot_position: usize,
-    carrier_sequence: u8,
-    packet: [u8; 188],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -830,6 +1392,11 @@ impl<'a> BitReader<'a> {
     }
 }
 
+/* ============================================================
+ * TLV reassembler
+ * ============================================================
+ */
+
 #[derive(Debug, Clone, Copy, Default)]
 struct TlvStats {
     split_packets: u64,
@@ -845,7 +1412,7 @@ struct TlvStats {
 
 struct TlvReassembler {
     payload_start: usize,
-    out: Option<File>,
+    out: Option<Box<dyn Write>>,
     aligned: bool,
     buf: Vec<u8>,
 
@@ -854,7 +1421,7 @@ struct TlvReassembler {
 }
 
 impl TlvReassembler {
-    fn new(payload_start: usize, out: Option<File>) -> Self {
+    fn new(payload_start: usize, out: Option<Box<dyn Write>>) -> Self {
         Self {
             payload_start,
             out,
@@ -912,8 +1479,6 @@ impl TlvReassembler {
                 self.buf.extend_from_slice(&payload[begin..]);
                 self.aligned = true;
             } else {
-                // pointer byteだけを除去する。
-                // pointer前のデータは前TLVの残りなので捨てない。
                 self.buf.extend_from_slice(&payload[1..]);
             }
         } else if self.aligned {
@@ -936,14 +1501,6 @@ impl TlvReassembler {
             let length = read_u16_be(&self.buf[2..4]) as usize;
             let total_len = 4 + length;
 
-            /*
-             * typeを少しだけ制限する。
-             *
-             * 0x7FFF = Null TLV
-             * 0x0001..0x0004 あたり = IPv4/IPv6/圧縮IP/制御系想定
-             *
-             * ここが厳しすぎる場合は looks_like_valid_tlv_type を広げる。
-             */
             if !looks_like_valid_tlv_type(packet_type) {
                 self.bad_and_resync();
                 return;
@@ -957,7 +1514,6 @@ impl TlvReassembler {
             if self.buf.len() < total_len {
                 self.stats.remaining_buf = self.buf.len();
 
-                // ランダム長を掴んで巨大に待ち続ける候補を落とす
                 if self.buf.len() > 128 * 1024 {
                     self.bad_and_resync();
                 }
@@ -1000,6 +1556,10 @@ impl TlvReassembler {
     fn finish(&mut self) {
         self.flush_complete_tlv_packets();
         self.stats.remaining_buf = self.buf.len();
+
+        if let Some(out) = self.out.as_mut() {
+            let _ = out.flush();
+        }
 
         eprintln!(
             "tlv reassembler: payload_start={} split_packets={} starts={} tlv_packets={} null_packets={} non_null_packets={} bad={} resync={} remaining_buf={} max_buf={} aligned={}",
