@@ -147,7 +147,7 @@ fn run_file_mode() {
 
         superframe_count += 1;
 
-        if superframe_count % 100 == 0 {
+        if superframe_count.is_multiple_of(100) {
             eprintln!(
                 "output superframes={} stats={:?}",
                 superframe_count,
@@ -155,11 +155,10 @@ fn run_file_mode() {
             );
         }
 
-        if let Some(limit) = LIMIT_OUTPUT_SUPERFRAMES {
-            if superframe_count >= limit {
+        if let Some(limit) = LIMIT_OUTPUT_SUPERFRAMES
+            && superframe_count >= limit {
                 break;
             }
-        }
     }
 
     out.finish();
@@ -406,10 +405,7 @@ fn read_one_superframe_from_files(streams: &mut [FileStreamState]) -> Option<Vec
 
     for stream in streams.iter_mut() {
         for _ in 0..n_frames {
-            let frame = match read_one_tsmf_frame_from_file(stream) {
-                Some(f) => f,
-                None => return None,
-            };
+            let frame = read_one_tsmf_frame_from_file(stream)?;
 
             let fp = frame.header.frame_position as usize;
 
