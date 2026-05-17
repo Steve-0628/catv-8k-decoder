@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
     path::PathBuf,
@@ -6,15 +7,27 @@ use std::{
 
 const TS_PACKET_SIZE: usize = 188;
 const DATA_SLOTS_PER_TSMF: usize = 52;
-const MAX_RSN: usize = 16;
-
-// 全部やるなら None
-// const LIMIT_SUPER_FRAMES: Option<u64> = Some(1000);
-const LIMIT_SUPER_FRAMES: Option<u64> = None;
-
 
 const PID_EXTENDED_TSMF_HEADER: u16 = 0x002f;
 const PID_SPLIT_TLV: u16 = 0x002d;
+
+// あなたの環境では RSN 1 が本命だった
+const TARGET_RSN: u8 = 1;
+
+// 256QAMなら基本4
+const EXPECTED_NUMBER_OF_FRAMES: usize = 4;
+
+// fp=0候補をどれだけ集めるか。
+// 1000 superframe ≒ 6秒くらいだったなら、1800は約10秒強相当。
+const FP0_CANDIDATES_TO_SCAN: usize = 1800;
+
+// 出力を途中で止めたいなら Some(n)
+const LIMIT_OUTPUT_SUPERFRAMES: Option<u64> = None;
+
+const BASE_INDEX: usize = 12;
+const MAX_SHIFT: isize = 16;
+const FAST_TEST_SUPERFRAMES: usize = 8;
+const PAYLOAD_START: usize = 3; // 映像が出ていた方にする。4で出たなら4。
 
 fn main() {
     let mut paths: Vec<PathBuf> = std::fs::read_dir("./in")
@@ -24,229 +37,276 @@ fn main() {
 
     paths.sort();
 
-    if paths.is_empty() {
-        panic!("./in/ にTSファイルがありません");
+    if paths.len() < 3 {
+        panic!("最低3波分のTSファイルが必要です。./in/ に3ファイル置いてください");
     }
 
     eprintln!("input files:");
-    for path in &paths {
-        eprintln!("  {:?}", path);
+    for p in &paths {
+        eprintln!("  {:?}", p);
     }
 
-    let mut streams: Vec<StreamState> = paths
+    eprintln!("scanning fp=0 candidates...");
+
+    let mut candidate_lists: Vec<Vec<SyncCandidate>> = paths
         .iter()
-        .map(open_and_sync_to_frame0)
+        .map(|path| scan_fp0_candidates(path, FP0_CANDIDATES_TO_SCAN))
+        .collect();
+
+    for list in &candidate_lists {
+        if list.is_empty() {
+            panic!("fp=0 candidate が見つからないファイルがあります");
+        }
+    }
+
+    // carrier_sequence順に並べる
+    candidate_lists.sort_by_key(|list| list[0].carrier_sequence);
+
+    eprintln!("candidate summary:");
+    for list in &candidate_lists {
+        let first = &list[0];
+        eprintln!(
+            "  {:?}: carrier={} candidates={} first_offset={} number_of_carriers={} number_of_frames={}",
+            first.path,
+            first.carrier_sequence,
+            list.len(),
+            first.offset,
+            first.number_of_carriers,
+            first.number_of_frames
+        );
+    }
+
+    let best = find_best_sync(&candidate_lists);
+
+    eprintln!("best sync:");
+    eprintln!("  score={}", best.score);
+    eprintln!("  payload_start={}", best.payload_start);
+    eprintln!("  stats={:?}", best.stats);
+    for (i, idx) in best.indices.iter().enumerate() {
+        let c = &candidate_lists[i][*idx];
+        eprintln!(
+            "  stream{} carrier={} candidate_index={} offset={}",
+            i, c.carrier_sequence, idx, c.offset
+        );
+    }
+
+    eprintln!("writing output from best sync...");
+
+    let mut streams: Vec<StreamState> = best
+        .indices
+        .iter()
+        .enumerate()
+        .map(|(stream_idx, candidate_idx)| {
+            let c = &candidate_lists[stream_idx][*candidate_idx];
+            open_stream_at_candidate(c)
+        })
         .collect();
 
     streams.sort_by_key(|s| s.carrier_sequence);
 
-    eprintln!("synced streams:");
-    for s in &streams {
+    let mut out = TlvReassembler::new(best.payload_start, Some(File::create("out_rsn_01.mmts").unwrap()));
+
+    let mut superframe_count = 0u64;
+
+    loop {
+        let ok = process_one_superframe(&mut streams, &mut out, TARGET_RSN);
+
+        if !ok {
+            break;
+        }
+
+        superframe_count += 1;
+
+        if superframe_count % 100 == 0 {
+            eprintln!(
+                "output superframes={} stats={:?}",
+                superframe_count,
+                out.stats()
+            );
+        }
+
+        if let Some(limit) = LIMIT_OUTPUT_SUPERFRAMES {
+            if superframe_count >= limit {
+                break;
+            }
+        }
+    }
+
+    out.finish();
+
+    eprintln!("done");
+    eprintln!("output superframes={}", superframe_count);
+    eprintln!("output file: out_rsn_01.mmts");
+}
+
+#[derive(Debug, Clone)]
+struct SyncCandidate {
+    path: PathBuf,
+    offset: u64,
+    carrier_sequence: u8,
+    number_of_carriers: u8,
+    number_of_frames: u8,
+}
+
+#[derive(Debug, Clone)]
+struct TrialResult {
+    score: i128,
+    payload_start: usize,
+    indices: Vec<usize>,
+    stats: TlvStats,
+}
+
+fn find_best_sync(candidate_lists: &[Vec<SyncCandidate>]) -> TrialResult {
+    if candidate_lists.len() != 3 {
+        panic!("この版は3波前提です");
+    }
+
+    for (i, list) in candidate_lists.iter().enumerate() {
+        // if list.len() <= BASE_INDEX {
+        //     panic!(
+        //         "stream {} の候補数が足りません: candidates={} BASE_INDEX={}",
+        //         i,
+        //         list.len(),
+        //         BASE_INDEX
+        //     );
+        // }
+    }
+
+    let mut results = Vec::new();
+
+    eprintln!(
+        "fast sync search: base_index={} carrier1 fixed, carrier2/3 shift={}..{} payload_start={}",
+        BASE_INDEX,
+        -MAX_SHIFT,
+        MAX_SHIFT,
+        PAYLOAD_START
+    );
+
+    for s2 in -MAX_SHIFT..=MAX_SHIFT {
+        for s3 in -MAX_SHIFT..=MAX_SHIFT {
+            let i0 = BASE_INDEX as isize;
+            let i1 = BASE_INDEX as isize + s2;
+            let i2 = BASE_INDEX as isize + s3;
+
+            if i1 < 0 || i2 < 0 {
+                continue;
+            }
+
+            let indices = vec![i0 as usize, i1 as usize, i2 as usize];
+
+            if indices[1] >= candidate_lists[1].len()
+                || indices[2] >= candidate_lists[2].len()
+            {
+                continue;
+            }
+
+            if let Some(result) = run_trial(
+                candidate_lists,
+                &indices,
+                PAYLOAD_START,
+                FAST_TEST_SUPERFRAMES,
+            ) {
+                results.push(result);
+            }
+        }
+    }
+
+    if results.is_empty() {
+        panic!("有効な同期候補が見つかりませんでした");
+    }
+
+    results.sort_by_key(|r| r.score);
+
+    eprintln!("fast search top:");
+    for r in results.iter().take(20) {
         eprintln!(
-            "  {:?}: carrier_sequence={} number_of_carriers={} number_of_frames={} offset={}",
-            s.path,
-            s.carrier_sequence,
-            s.number_of_carriers,
-            s.number_of_frames,
-            s.offset
+            "  score={} indices={:?} stats={:?}",
+            r.score, r.indices, r.stats
         );
     }
 
-    let n_carriers = streams.len();
-    let n_frames = streams[0].number_of_frames as usize;
+    results[0].clone()
+}
+fn run_trial(
+    candidate_lists: &[Vec<SyncCandidate>],
+    indices: &[usize],
+    payload_start: usize,
+    test_superframes: usize,
+) -> Option<TrialResult> {
+    let mut streams: Vec<StreamState> = indices
+        .iter()
+        .enumerate()
+        .map(|(stream_idx, candidate_idx)| {
+            let c = &candidate_lists[stream_idx][*candidate_idx];
+            open_stream_at_candidate(c)
+        })
+        .collect();
 
-    if n_frames != 3 && n_frames != 4 {
-        panic!("number_of_frames が仕様外です: {}", n_frames);
+    streams.sort_by_key(|s| s.carrier_sequence);
+
+    let mut reassembler = TlvReassembler::new(payload_start, None);
+
+    let mut ok_superframes = 0usize;
+
+    for _ in 0..test_superframes {
+        if !process_one_superframe(&mut streams, &mut reassembler, TARGET_RSN) {
+            break;
+        }
+
+        ok_superframes += 1;
+
+        let st = reassembler.stats();
+
+        // 明らかなハズレは即打ち切り
+        if st.bad > 20 || st.resync > 20 {
+            break;
+        }
     }
 
-    eprintln!("n_carriers={} n_frames={}", n_carriers, n_frames);
-
-    let mut out_rsn_01 = TlvReassembler::new(File::create("out_rsn_01.mmts").unwrap());
-
-    let mut super_frame_count: u64 = 0;
-
-    'outer: loop {
-        /*
-         * superframe[frame_position][carrier_index]
-         *
-         * 1搬送波につき number_of_frames 個の拡張TSMFを読む。
-         * 256QAMなら 4個。
-         * 64QAMなら 3個。
-         */
-        let mut superframe: Vec<Vec<TsmfFrame>> = (0..n_frames)
-            .map(|_| Vec::with_capacity(n_carriers))
-            .collect();
-
-        for stream in streams.iter_mut() {
-            for _ in 0..n_frames {
-                let frame = match read_one_tsmf_frame(stream) {
-                    Some(f) => f,
-                    None => break 'outer,
-                };
-
-                let fp = frame.header.frame_position as usize;
-
-                if fp >= n_frames {
-                    eprintln!(
-                        "invalid frame_position={} carrier={}",
-                        frame.header.frame_position,
-                        frame.header.carrier_sequence
-                    );
-                    break 'outer;
-                }
-
-                superframe[fp].push(frame);
-            }
-        }
-
-        for fp in 0..n_frames {
-            superframe[fp].sort_by_key(|f| f.header.carrier_sequence);
-
-            if superframe[fp].len() != n_carriers {
-                eprintln!(
-                    "frame_position={} has {} carriers, expected {}",
-                    fp,
-                    superframe[fp].len(),
-                    n_carriers
-                );
-                break 'outer;
-            }
-        }
-
-        if super_frame_count % 100 == 0 {
-            eprintln!("super_frame_count={}", super_frame_count);
-
-            for fp in 0..n_frames {
-                eprintln!("  frame_position={}", fp);
-
-                for f in &superframe[fp] {
-                    eprintln!(
-                        "    carrier={} group_id={} rsn[0..16]={:?} stream_type[0..15]={:?}",
-                        f.header.carrier_sequence,
-                        f.header.group_id,
-                        &f.header.relative_stream_number[0..16],
-                        &f.header.stream_type
-                    );
-                }
-            }
-        }
-
-        /*
-         * 総務省資料 4.7.2 の順序:
-         *
-         *   subframe
-         *     slot_position
-         *       carrier_sequence
-         *
-         * ここでは、各データスロットに対して、
-         *
-         *   full_slot_index = frame_position * 53 + slot_index
-         *
-         * とする。
-         *
-         * slot_index は:
-         *   0      = 拡張TSMFヘッダスロット
-         *   1..52  = データスロット
-         *
-         * なので、relative_stream_number[0] に対応するスロットは slot_index=1。
-         */
-        let mut ordered_slots: Vec<OrderedSlot> = Vec::new();
-
-        for fp in 0..n_frames {
-            for carrier_idx in 0..n_carriers {
-                let frame = &superframe[fp][carrier_idx];
-
-                for data_slot_idx in 0..DATA_SLOTS_PER_TSMF {
-                    let slot_index_in_tsmf = data_slot_idx + 1;
-                    let full_slot_index = fp * 53 + slot_index_in_tsmf;
-
-                    let subframe = full_slot_index / n_frames;
-                    let slot_position = full_slot_index % n_frames;
-
-                    let rsn = frame.header.relative_stream_number[data_slot_idx];
-
-                    if rsn == 0 {
-                        continue;
-                    }
-
-                    let rsn_idx = (rsn - 1) as usize;
-
-                    if rsn_idx >= frame.header.stream_type.len() {
-                        continue;
-                    }
-
-                    let is_tlv = frame.header.stream_type[rsn_idx] == StreamKind::Tlv;
-
-                    if !is_tlv {
-                        continue;
-                    }
-
-                    ordered_slots.push(OrderedSlot {
-                        subframe,
-                        slot_position,
-                        carrier_sequence: frame.header.carrier_sequence,
-                        rsn,
-                        packet: frame.slots[data_slot_idx],
-                    });
-                }
-            }
-        }
-
-        ordered_slots.sort_by_key(|s| {
-            (
-                s.subframe,
-                s.slot_position,
-                s.carrier_sequence,
-            )
-        });
-
-        for s in ordered_slots {
-            if super_frame_count < 2 {
-                eprintln!(
-                    "sf={} sp={} carrier={} rsn={} head={:02X} {:02X} {:02X} {:02X}",
-                    s.subframe,
-                    s.slot_position,
-                    s.carrier_sequence,
-                    s.rsn,
-                    s.packet[0],
-                    s.packet[1],
-                    s.packet[2],
-                    s.packet[3],
-                );
-            }
-
-            if s.rsn == 1 {
-                out_rsn_01.feed_split_tlv_packet(&s.packet);
-            }
-        }
-
-        super_frame_count += 1;
-
-        if let Some(limit) = LIMIT_SUPER_FRAMES
-            && super_frame_count >= limit {
-                break;
-            }
+    if ok_superframes == 0 {
+        return None;
     }
 
-    out_rsn_01.finish();
+    let stats = reassembler.stats();
+    let score = score_stats(&stats, ok_superframes);
 
-    eprintln!("done: super_frame_count={}", super_frame_count);
-    eprintln!("generated:");
-    eprintln!("  out_tlv_all.mmts");
-    eprintln!("  out_rsn_00.mmts ... out_rsn_15.mmts");
+    Some(TrialResult {
+        score,
+        payload_start,
+        indices: indices.to_vec(),
+        stats,
+    })
+}
+fn score_stats(stats: &TlvStats, ok_superframes: usize) -> i128 {
+    let mut score = 0i128;
+
+    score += stats.bad as i128 * 1_000_000;
+    score += stats.resync as i128 * 1_000_000;
+    score += stats.remaining_buf as i128 * 10;
+    score += stats.max_buf as i128;
+
+    score -= stats.tlv_packets as i128 * 1_000;
+    score -= stats.non_null_packets as i128 * 5_000;
+    score -= stats.null_packets as i128 * 100;
+    score -= ok_superframes as i128 * 100_000;
+
+    if stats.tlv_packets == 0 {
+        score += 1_000_000_000;
+    }
+
+    score
 }
 
-fn open_and_sync_to_frame0(path: &PathBuf) -> StreamState {
+fn scan_fp0_candidates(path: &PathBuf, max_candidates: usize) -> Vec<SyncCandidate> {
     let mut file = File::open(path).unwrap();
     let mut buf = [0u8; TS_PACKET_SIZE];
 
-    let mut offset: u64 = 0;
+    let mut offset = 0u64;
+    let mut candidates = Vec::new();
 
     loop {
-        file.seek(SeekFrom::Start(offset)).unwrap();
-
         if file.read_exact(&mut buf).is_err() {
-            panic!("frame_position=0 が見つからなかった: {:?}", path);
+            break;
         }
 
         let pid = packet_pid(&buf);
@@ -255,31 +315,157 @@ fn open_and_sync_to_frame0(path: &PathBuf) -> StreamState {
             let header = ExtendedTsmfHeader::parse(&buf);
 
             if header.frame_position == 0 {
-                eprintln!(
-                    "{:?}: synced carrier_sequence={} number_of_carriers={} number_of_frames={} frame_position={} offset={}",
-                    path,
-                    header.carrier_sequence,
-                    header.number_of_carriers,
-                    header.number_of_frames,
-                    header.frame_position,
-                    offset
-                );
-
-                file.seek(SeekFrom::Start(offset)).unwrap();
-
-                return StreamState {
+                candidates.push(SyncCandidate {
                     path: path.clone(),
-                    file,
                     offset,
                     carrier_sequence: header.carrier_sequence,
                     number_of_carriers: header.number_of_carriers,
                     number_of_frames: header.number_of_frames,
-                };
+                });
+
+                if candidates.len() >= max_candidates {
+                    break;
+                }
             }
         }
 
         offset += TS_PACKET_SIZE as u64;
     }
+
+    eprintln!("{:?}: fp0 candidates={}", path, candidates.len());
+
+    candidates
+}
+
+fn open_stream_at_candidate(candidate: &SyncCandidate) -> StreamState {
+    let mut file = File::open(&candidate.path).unwrap();
+    file.seek(SeekFrom::Start(candidate.offset)).unwrap();
+
+    StreamState {
+        path: candidate.path.clone(),
+        file,
+        offset: candidate.offset,
+        carrier_sequence: candidate.carrier_sequence,
+        number_of_carriers: candidate.number_of_carriers,
+        number_of_frames: candidate.number_of_frames,
+    }
+}
+
+fn process_one_superframe(
+    streams: &mut [StreamState],
+    reassembler: &mut TlvReassembler,
+    target_rsn: u8,
+) -> bool {
+    let n_carriers = streams.len();
+    let n_frames = streams[0].number_of_frames as usize;
+
+    if n_frames != EXPECTED_NUMBER_OF_FRAMES {
+        eprintln!("unexpected number_of_frames={}", n_frames);
+        return false;
+    }
+
+    let mut superframe: Vec<Vec<TsmfFrame>> = (0..n_frames)
+        .map(|_| Vec::with_capacity(n_carriers))
+        .collect();
+
+    for stream in streams.iter_mut() {
+        for _ in 0..n_frames {
+            let frame = match read_one_tsmf_frame(stream) {
+                Some(f) => f,
+                None => return false,
+            };
+
+            let fp = frame.header.frame_position as usize;
+
+            if fp >= n_frames {
+                eprintln!(
+                    "invalid frame_position={} carrier={}",
+                    frame.header.frame_position,
+                    frame.header.carrier_sequence
+                );
+                return false;
+            }
+
+            superframe[fp].push(frame);
+        }
+    }
+
+    for fp in 0..n_frames {
+        superframe[fp].sort_by_key(|f| f.header.carrier_sequence);
+
+        if superframe[fp].len() != n_carriers {
+            eprintln!(
+                "missing carriers at fp={} got={} expected={}",
+                fp,
+                superframe[fp].len(),
+                n_carriers
+            );
+            return false;
+        }
+    }
+
+    let mut ordered_slots = Vec::new();
+
+    for fp in 0..n_frames {
+        for carrier_idx in 0..n_carriers {
+            let frame = &superframe[fp][carrier_idx];
+
+            for data_slot_idx in 0..DATA_SLOTS_PER_TSMF {
+                let rsn = frame.header.relative_stream_number[data_slot_idx];
+
+                if rsn != target_rsn {
+                    continue;
+                }
+
+                let rsn_idx = (rsn - 1) as usize;
+
+                if rsn_idx >= frame.header.stream_type.len() {
+                    continue;
+                }
+
+                if frame.header.stream_type[rsn_idx] != StreamKind::Tlv {
+                    continue;
+                }
+
+                /*
+                 * 仕様の合成順:
+                 *   subframe
+                 *     slot_position
+                 *       carrier_sequence
+                 *
+                 * 拡張TSMFは 53 slots。
+                 * slot 0 はヘッダ。
+                 * data_slot_idx 0 は slot 1 に相当。
+                 */
+                let slot_index_in_tsmf = data_slot_idx + 1;
+                let full_slot_index = fp * 53 + slot_index_in_tsmf;
+
+                let subframe = full_slot_index / n_frames;
+                let slot_position = full_slot_index % n_frames;
+
+                ordered_slots.push(OrderedSlot {
+                    subframe,
+                    slot_position,
+                    carrier_sequence: frame.header.carrier_sequence,
+                    packet: frame.slots[data_slot_idx],
+                });
+            }
+        }
+    }
+
+    ordered_slots.sort_by_key(|s| {
+        (
+            s.subframe,
+            s.slot_position,
+            s.carrier_sequence,
+        )
+    });
+
+    for slot in ordered_slots {
+        reassembler.feed_split_tlv_packet(&slot.packet);
+    }
+
+    true
 }
 
 fn read_one_tsmf_frame(stream: &mut StreamState) -> Option<TsmfFrame> {
@@ -367,98 +553,6 @@ fn packet_start_indicator(data: &[u8; 188]) -> bool {
     (data[1] & 0x40) != 0
 }
 
-/*
- * 分割TLVパケット → 生TLVストリーム復元
- *
- * 分割TLVパケット構造:
- *
- *   byte 0      : 0x47
- *   byte 1..2   : TEI / TLV packet start indicator / '0' / PID
- *   byte 3..187 : payload 185B
- *
- * TLV packet start indicator が 1 のとき:
- *
- *   payload[0] が「先頭TLV指示」
- *   payload[1..] が実データ
- *
- * 以前の data[4..] 固定は、start indicator=0 のパケットで
- * payload先頭1バイトを毎回捨てるので壊れる。
- */
-struct TlvReassembler {
-    out: File,
-    aligned: bool,
-    packet_count: u64,
-    start_count: u64,
-}
-
-impl TlvReassembler {
-    fn new(out: File) -> Self {
-        Self {
-            out,
-            aligned: false,
-            packet_count: 0,
-            start_count: 0,
-        }
-    }
-
-    fn feed_split_tlv_packet(&mut self, packet: &[u8; 188]) {
-        self.packet_count += 1;
-
-        if packet[0] != 0x47 {
-            eprintln!("split TLV sync mismatch: {:02X}", packet[0]);
-            return;
-        }
-
-        let pid = packet_pid(packet);
-        if pid != PID_SPLIT_TLV {
-            return;
-        }
-
-        let payload = &packet[3..188];
-        let start = packet_start_indicator(packet);
-
-        if start {
-            self.start_count += 1;
-
-            let pointer = payload[0] as usize;
-
-            if pointer > 184 {
-                eprintln!("bad first_tlv_pointer={}", pointer);
-                return;
-            }
-
-            if !self.aligned {
-                /*
-                 * 最初だけは、前のTLVパケットの尻尾を捨てる。
-                 * pointerの位置から最初の完全なTLVが始まる。
-                 */
-                let begin = 1 + pointer;
-                self.out.write_all(&payload[begin..]).unwrap();
-                self.aligned = true;
-            } else {
-                /*
-                 * すでに同期済みなら、pointer前のバイトも前TLVの続きなので捨てない。
-                 * pointer byte 自体だけを除いて payload[1..] を全部出す。
-                 */
-                self.out.write_all(&payload[1..]).unwrap();
-            }
-        } else {
-            if self.aligned {
-                self.out.write_all(payload).unwrap();
-            }
-        }
-    }
-
-    fn finish(&mut self) {
-        eprintln!(
-            "tlv reassembler: packets={} starts={} aligned={}",
-            self.packet_count,
-            self.start_count,
-            self.aligned
-        );
-    }
-}
-
 #[derive(Debug)]
 struct StreamState {
     path: PathBuf,
@@ -480,7 +574,6 @@ struct OrderedSlot {
     subframe: usize,
     slot_position: usize,
     carrier_sequence: u8,
-    rsn: u8,
     packet: [u8; 188],
 }
 
@@ -507,7 +600,6 @@ struct ExtendedTsmfHeader {
     emergency_indicator: bool,
 
     relative_stream_number: [u8; 52],
-
     stream_type: [StreamKind; 15],
 
     group_id: u8,
@@ -736,4 +828,213 @@ impl<'a> BitReader<'a> {
 
         bit
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct TlvStats {
+    split_packets: u64,
+    starts: u64,
+    tlv_packets: u64,
+    null_packets: u64,
+    non_null_packets: u64,
+    bad: u64,
+    resync: u64,
+    remaining_buf: usize,
+    max_buf: usize,
+}
+
+struct TlvReassembler {
+    payload_start: usize,
+    out: Option<File>,
+    aligned: bool,
+    buf: Vec<u8>,
+
+    stats: TlvStats,
+    type_counts: BTreeMap<u16, u64>,
+}
+
+impl TlvReassembler {
+    fn new(payload_start: usize, out: Option<File>) -> Self {
+        Self {
+            payload_start,
+            out,
+            aligned: false,
+            buf: Vec::with_capacity(1024 * 1024),
+
+            stats: TlvStats::default(),
+            type_counts: BTreeMap::new(),
+        }
+    }
+
+    fn feed_split_tlv_packet(&mut self, packet: &[u8; 188]) {
+        self.stats.split_packets += 1;
+
+        if packet[0] != 0x47 {
+            self.bad_and_resync();
+            return;
+        }
+
+        if packet_pid(packet) != PID_SPLIT_TLV {
+            return;
+        }
+
+        if self.payload_start >= 188 {
+            self.bad_and_resync();
+            return;
+        }
+
+        let start = packet_start_indicator(packet);
+        let payload = &packet[self.payload_start..188];
+
+        if start {
+            self.stats.starts += 1;
+
+            if payload.is_empty() {
+                self.bad_and_resync();
+                return;
+            }
+
+            let pointer = payload[0] as usize;
+
+            if pointer > payload.len().saturating_sub(1) {
+                self.bad_and_resync();
+                return;
+            }
+
+            if !self.aligned {
+                let begin = 1 + pointer;
+
+                if begin > payload.len() {
+                    self.bad_and_resync();
+                    return;
+                }
+
+                self.buf.extend_from_slice(&payload[begin..]);
+                self.aligned = true;
+            } else {
+                // pointer byteだけを除去する。
+                // pointer前のデータは前TLVの残りなので捨てない。
+                self.buf.extend_from_slice(&payload[1..]);
+            }
+        } else if self.aligned {
+            self.buf.extend_from_slice(payload);
+        }
+
+        self.stats.max_buf = self.stats.max_buf.max(self.buf.len());
+
+        self.flush_complete_tlv_packets();
+    }
+
+    fn flush_complete_tlv_packets(&mut self) {
+        loop {
+            if self.buf.len() < 4 {
+                self.stats.remaining_buf = self.buf.len();
+                return;
+            }
+
+            let packet_type = read_u16_be(&self.buf[0..2]);
+            let length = read_u16_be(&self.buf[2..4]) as usize;
+            let total_len = 4 + length;
+
+            /*
+             * typeを少しだけ制限する。
+             *
+             * 0x7FFF = Null TLV
+             * 0x0001..0x0004 あたり = IPv4/IPv6/圧縮IP/制御系想定
+             *
+             * ここが厳しすぎる場合は looks_like_valid_tlv_type を広げる。
+             */
+            if !looks_like_valid_tlv_type(packet_type) {
+                self.bad_and_resync();
+                return;
+            }
+
+            if total_len > 65539 {
+                self.bad_and_resync();
+                return;
+            }
+
+            if self.buf.len() < total_len {
+                self.stats.remaining_buf = self.buf.len();
+
+                // ランダム長を掴んで巨大に待ち続ける候補を落とす
+                if self.buf.len() > 128 * 1024 {
+                    self.bad_and_resync();
+                }
+
+                return;
+            }
+
+            let packet = &self.buf[..total_len];
+
+            if let Some(out) = self.out.as_mut() {
+                out.write_all(packet).unwrap();
+            }
+
+            self.stats.tlv_packets += 1;
+
+            *self.type_counts.entry(packet_type).or_insert(0) += 1;
+
+            if packet_type == 0x7fff {
+                self.stats.null_packets += 1;
+            } else {
+                self.stats.non_null_packets += 1;
+            }
+
+            self.buf.drain(..total_len);
+
+            if self.buf.capacity() > 4 * 1024 * 1024 && self.buf.len() < 1024 {
+                self.buf.shrink_to(1024 * 1024);
+            }
+        }
+    }
+
+    fn bad_and_resync(&mut self) {
+        self.stats.bad += 1;
+        self.stats.resync += 1;
+        self.aligned = false;
+        self.buf.clear();
+        self.stats.remaining_buf = 0;
+    }
+
+    fn finish(&mut self) {
+        self.flush_complete_tlv_packets();
+        self.stats.remaining_buf = self.buf.len();
+
+        eprintln!(
+            "tlv reassembler: payload_start={} split_packets={} starts={} tlv_packets={} null_packets={} non_null_packets={} bad={} resync={} remaining_buf={} max_buf={} aligned={}",
+            self.payload_start,
+            self.stats.split_packets,
+            self.stats.starts,
+            self.stats.tlv_packets,
+            self.stats.null_packets,
+            self.stats.non_null_packets,
+            self.stats.bad,
+            self.stats.resync,
+            self.stats.remaining_buf,
+            self.stats.max_buf,
+            self.aligned
+        );
+
+        if self.out.is_some() {
+            eprintln!("TLV packet types:");
+            for (packet_type, count) in &self.type_counts {
+                eprintln!("  type=0x{:04X} count={}", packet_type, count);
+            }
+        }
+    }
+
+    fn stats(&self) -> TlvStats {
+        let mut s = self.stats;
+        s.remaining_buf = self.buf.len();
+        s
+    }
+}
+
+fn looks_like_valid_tlv_type(packet_type: u16) -> bool {
+    packet_type == 0x7fff || packet_type <= 0x7ffe
+}
+
+fn read_u16_be(bytes: &[u8]) -> u16 {
+    ((bytes[0] as u16) << 8) | bytes[1] as u16
 }
