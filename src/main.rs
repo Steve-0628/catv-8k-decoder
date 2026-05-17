@@ -1,249 +1,334 @@
-#![feature(path_file_prefix)]
 use std::{
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
 };
 
 fn main() {
-    let paths = std::fs::read_dir("./in").unwrap();
-    let file_readers: Vec<std::fs::File> = paths
-        .map(|p| {
-            let path = p.unwrap().path();
-            std::fs::File::open(path).unwrap()
-        })
+    // ./in/ 以下のTSファイルを全部読む
+    let mut paths: Vec<_> = std::fs::read_dir("./in")
+        .unwrap()
+        .map(|p| p.unwrap().path())
         .collect();
-    dbg!(&file_readers);
-    let mut streams: Vec<TsmfInfo> = file_readers
-        .iter()
-        .map(|mut reader| {
-            let mut offset: u64 = 0;
-            // let mut ts_packet_itr = vec![0, 188];
-            // reader.read_exact(&mut ts_packet_itr).unwrap();
-            // offset += *(ts_packet_itr
-            //     .iter()
-            //     .find(|byte| **byte == 0x47)
-            //     .unwrap_or(&0)) as u64;
+    paths.sort(); // ファイル名順にソート（念のため）
 
-            let mut ts_packet = vec![0; 188];
+    // まず各ファイルの frame_position=0 を探して位相を合わせる
+    let mut streams: Vec<StreamState> = paths
+        .iter()
+        .map(|path| {
+            let mut file = File::open(path).unwrap();
+            let mut buf = [0u8; 188];
+            let mut offset: u64 = 0;
+
             loop {
-                reader.seek(SeekFrom::Start(offset)).unwrap();
-                reader.read_exact(&mut ts_packet).unwrap();
-                let packet: [u8; 188] = ts_packet[..].try_into().unwrap();
-                let packet = TSPacket::from(packet);
+                file.seek(SeekFrom::Start(offset)).unwrap();
+                if file.read_exact(&mut buf).is_err() {
+                    panic!("frame_position=0 が見つからなかった: {:?}", path);
+                }
+                let packet = TSPacket::from(buf);
                 if packet.pid == 0x2f {
-                    // TSMF header
                     let tsmf = TSMFHeaderPacket::from(packet.payload);
-                    if tsmf.frame_location == 0 {
-                        return TsmfInfo {
-                            stream_id: tsmf.streams_order,
-                            offset_bytes: offset,
-                            file: reader,
+                    if tsmf.frame_position == 0 {
+                        println!(
+                            "{:?}: carrier_sequence={} number_of_carriers={} number_of_frames={} frame_position={}",
+                            path,
+                            tsmf.carrier_sequence,
+                            tsmf.number_of_carriers,
+                            tsmf.number_of_frames,
+                            tsmf.frame_position
+                        );
+                        return StreamState {
+                            carrier_sequence: tsmf.carrier_sequence,
+                            number_of_frames: tsmf.number_of_frames,
+                            offset,
+                            file,
                         };
                     }
                 }
                 offset += 188;
             }
         })
-        .collect::<Vec<TsmfInfo>>();
-    streams.sort_by(|a, b| a.stream_id.cmp(&b.stream_id));
-    dbg!(&streams);
+        .collect();
+
+    // carrier_sequence 順にソート
+    streams.sort_by_key(|s| s.carrier_sequence);
+
+    let n_carriers = streams.len();
+    // number_of_frames は全波共通のはずだが、念のため最初のストリームから取る
+    let number_of_frames = streams[0].number_of_frames as usize;
+
+    println!(
+        "搬送波数: {}, number_of_frames: {}",
+        n_carriers, number_of_frames
+    );
 
     let mut outfile = File::create("out.mmts").unwrap();
 
-    let mut current_stream = 0;
-    let mut ts_packet = vec![0; 188];
-    while streams[current_stream]
-        .file
-        .read_exact(&mut ts_packet)
-        .is_ok()
-    {
-        let packet: [u8; 188] = ts_packet[..].try_into().unwrap();
-        let packet = TSPacket::from(packet);
-        match packet.pid {
-            0x2f => {
-                // TSMF contorl packet
-                let tsmf = TSMFHeaderPacket::from(packet.payload);
-                // TODO
-                current_stream += 1;
-                current_stream /= streams.len();
-                continue;
-            }
-            0x2d => {
-                if packet.payload_unit_start_indicator {
-                    let realmmt: [u8; 184] = packet.mmt[1..].try_into().unwrap();
-                    let _ = outfile.write(&realmmt).unwrap();
-                } else {
-                    let _ = outfile.write(&packet.mmt).unwrap();
+    // スーパーフレームは256QAMなので拡張TSMF×4
+    // サブフレームは53個/スーパーフレーム
+    // 各サブフレーム = number_of_frames 個のスロット
+    //
+    // 合成順: サブフレーム単位で、各搬送波の対応するスロット群を
+    // carrier_sequence 順に並べる
+    //
+    // 実装方針:
+    // 各ストリームから TSパケットを順番に読んでいき、
+    // 0x2d (TLVペイロード) を number_of_frames 個ずつ取り出して
+    // carrier_sequence 順に outfile に書く
+
+    // 'outer: loop {
+    //     // 各搬送波から number_of_frames 個の 0x2d パケットを集める
+    //     // let mut subframes: Vec<Vec<Vec<u8>>> = vec![Vec::new(); n_carriers];
+
+    //     // for (i, stream) in streams.iter_mut().enumerate() {
+    //     let mut i = 1;
+    //     loop {
+    //         // let mut collected = 0;
+    //         // let mut stream = streams[i];
+    //         let mut buf = [0u8; 188];
+
+    //         loop {
+    //             streams[i].file.seek(SeekFrom::Start(streams[i].offset)).unwrap();
+    //             if streams[i].file.read_exact(&mut buf).is_err() {
+    //                 // EOF
+    //                 break 'outer;
+    //             }
+    //             streams[i].offset += 188;
+
+    //             let packet = TSPacket::from(buf);
+    //             match packet.pid {
+    //                 0x2f => {
+    //                     // TSMFヘッダ: このサブフレームの区切りとして使う
+    //                     // number_of_frames 個集まったら次の搬送波へ
+    //                     // if collected >= number_of_frames {
+    //                     //     break;
+    //                     // }
+    //                     // まだ集まっていなければ読み飛ばして続ける 
+    //                     break;
+    //                 }
+    //                 0x2d => {
+    //                     let payload = extract_payload(&packet);
+    //                     // subframes[i].push(payload);
+    //                     // collected += 1;
+    //                     // if collected >= number_of_frames {
+    //                     //     break;
+    //                     // }
+    //                     let _ = outfile.write(&payload).unwrap();
+    //                 }
+    //                 _ => {}
+    //             }
+    //         }
+    //         i %= 3;
+    //         i+=1;
+
+    //     }
+
+    //     // carrier_sequence 順 (= streams のソート済み順) に書き出す
+    //     // for payloads in &subframes {
+    //     //     for payload in payloads {
+    //     //         outfile.write_all(payload).unwrap();
+    //     //     }
+    //     // }
+    // }
+    let mut super_frame_count = 0;
+    'outer: loop {
+        for stream in streams.iter_mut() {
+            let mut buf = [0u8; 188];
+            loop {
+                if stream.file.read_exact(&mut buf).is_err() {
+                    break 'outer;
+                }
+                let packet = TSPacket::from(buf);
+                match packet.pid {
+                    0x2f => {
+                        let tsmf = TSMFHeaderPacket::from(packet.payload.clone());
+                        eprintln!("stream {} frame_position={}", stream.carrier_sequence, tsmf.frame_position);
+                        if tsmf.frame_position == 3 {
+                            super_frame_count += 1;
+                        }
+                        break;
+                    }
+                    0x2d => {
+                        outfile.write_all(&packet.payload).unwrap();
+                    }
+                    _ => {}
                 }
             }
-            _ => {
-                // TODO: not implmented
-            }
         }
-        streams[current_stream].offset_bytes += 188;
+        if super_frame_count >= 1 {
+            break;
+        }
     }
+
+    // println!("{:?}", count);
+    eprintln!("完了");
 }
 
-#[derive(Debug)]
-struct TsmfInfo<'a> {
-    stream_id: u8,
-    offset_bytes: u64,
-    file: &'a File,
+/// TSパケットからペイロードを取り出す (adaptation field を考慮)
+// fn extract_payload(packet: &TSPacket) -> Vec<u8> {
+//     if packet.payload_unit_start_indicator && !packet.payload.is_empty() {
+//         packet.payload[1..].to_vec()
+//     } else {
+//         packet.payload.to_vec()
+//     }
+// }
+
+struct StreamState {
+    carrier_sequence: u8,
+    number_of_frames: u8,
+    offset: u64,
+    file: File,
 }
 
 struct TSPacket {
-    sync_byte: u8,
-    transport_error_indicator: bool,
+    pid: u16,
     payload_unit_start_indicator: bool,
-    transport_priority: bool,
-    pid: u16,                         // 13 bits
-    transport_scrambling_control: u8, // 2 bits
-    adaptation_field_control: u8,     // 2 bits
-    continuity_counter: u8,
-    payload: [u8; 184], // TODO: maybe implment adaptation field?
-    mmt: [u8; 185],
+    payload: Vec<u8>,
 }
 
 impl From<[u8; 188]> for TSPacket {
     fn from(data: [u8; 188]) -> Self {
-        let sync_byte = data[0];
-        let transport_error_indicator = ((data[1] & 0b1000_0000) >> 7) == 1;
-        let payload_unit_start_indicator = ((data[1] & 0b0100_0000) >> 6) == 1;
-        let transport_priority = ((data[1] & 0b0010_0000) >> 5) == 1;
         let pid = ((data[1] as u16 & 0b0001_1111) << 8) | data[2] as u16;
-        let transport_scrambling_control = (data[3] & 0b1100_0000) >> 6;
+        let payload_unit_start_indicator = ((data[1] & 0b0100_0000) >> 6) == 1;
         let adaptation_field_control = (data[3] & 0b0011_0000) >> 4;
-        let continuity_counter = data[3] & 0b0000_1111;
-        let payload = data[4..].try_into().unwrap();
-        let mmt = data[3..].try_into().unwrap();
+
+        // adaptation field を考慮してペイロード開始位置を決める
+        let payload_start = match adaptation_field_control {
+            0b10 => {
+                // adaptation fieldのみ、ペイロードなし
+                188 // 空
+            }
+            0b11 => {
+                // adaptation field + payload
+                let af_len = data[4] as usize;
+                5 + af_len // 4バイトヘッダ + 1バイト長さフィールド + adaptation field本体
+            }
+            _ => {
+                // 0b01: ペイロードのみ
+                4
+            }
+        };
+        // let payload: Vec<u8> = if payload_unit_start_indicator { data[4..].to_vec() } else { data[3..].to_vec() };
+        let payload = data[4..].to_vec();
         Self {
-            sync_byte,
-            transport_error_indicator,
-            payload_unit_start_indicator,
-            transport_priority,
             pid,
-            transport_scrambling_control,
-            adaptation_field_control,
-            continuity_counter,
+            payload_unit_start_indicator,
             payload,
-            mmt,
         }
     }
 }
 
 #[derive(Debug)]
 struct TSMFHeaderPacket {
-    sync_signal_unused: u8,                   // 3 bits
-    sync_signal: u16,                         // 13 bits
-    alter_indicator: u8,                      // 3bits;  1: static, 0: undefined
-    slot_info_indicator: bool,                // 1 bit
-    multi_frame_type: u8,                     // 4 bits;  0x1, 0x2, 0xF, undefined
-    relative_stream_enabled: [bool; 15],      // 15 bits
-    slot_info_undefined: u8,                  // 1 bit
-    relative_stream_info: [u32; 15],          // 32*15=480 bits [TSID, NID]
-    relative_stream_reception_info: [u8; 15], // 2*15=30 bits
-    transmission_control_undefined: u8,       // 1 bit
-    emergency_warning_info: u8,               // 1 bit
-    relative_stream_correspondence: [u8; 52], // 4*52=208 bits stream 2 to 53
-    // extended_information: [u8; 85],           // 680 bits todo: maybe parse?
-    earthquake_warning_information: [u8; 26], // 204 + 4 bits
-    stream_type: u16,                         // 7 bits
-    // stream_type_unused_0: u8,                  // 1 bit
-    streams_identification: u8, // 8 bits
-    streams_count: u8,          // 8 bits
-    streams_order: u8,          // 8 bits
-    frame_count: u8,            // 4 bits
-    frame_location: u8,         // 4 bits
-    extension_field: [u8; 53],  // 424 bits
-    crc: u32,                   // 32 bits
+    frame_sync: u16,
+    version_number: u8,
+    relative_stream_number_mode: bool,
+    frame_type: u8,
+    stream_status: [bool; 15],
+    stream_id: [u16; 15],
+    original_network_id: [u16; 15],
+    receive_status: [u8; 15],
+    emergency_indicator: bool,
+    relative_stream_number: [u8; 52],
+    earthquake_early_warning: [u8; 26],
+    stream_type: [bool; 15],
+    group_id: u8,
+    number_of_carriers: u8,
+    carrier_sequence: u8,
+    number_of_frames: u8,
+    frame_position: u8,
+    crc: u32,
 }
 
-impl From<[u8; 184]> for TSMFHeaderPacket {
-    fn from(data: [u8; 184]) -> Self {
-        let sync_signal_unused = data[0] & 0b1110_0000;
-        let sync_signal = ((data[0] as u16 & 0b0001_1111) << 8) | data[1] as u16;
-        let alter_indicator = (data[2] & 0b1110_0000) >> 5;
-        let slot_info_indicator = ((data[2] & 0b0001_0000) >> 4) == 1;
-        let multi_frame_type = data[2] & 0b0000_1111;
-        let relative_stream_enabled = [
-            ((data[3] & 0b1000_0000) >> 7) == 1,
-            ((data[3] & 0b0100_0000) >> 6) == 1,
-            ((data[3] & 0b0010_0000) >> 5) == 1,
-            ((data[3] & 0b0001_0000) >> 4) == 1,
-            ((data[3] & 0b0000_1000) >> 3) == 1,
-            ((data[3] & 0b0000_0100) >> 2) == 1,
-            ((data[3] & 0b0000_0010) >> 1) == 1,
-            ((data[3] & 0b0000_0001) >> 0) == 1,
-            ((data[4] & 0b1000_0000) >> 7) == 1,
-            ((data[4] & 0b0100_0000) >> 6) == 1,
-            ((data[4] & 0b0010_0000) >> 5) == 1,
-            ((data[4] & 0b0001_0000) >> 4) == 1,
-            ((data[4] & 0b0000_1000) >> 3) == 1,
-            ((data[4] & 0b0000_0100) >> 2) == 1,
-            ((data[4] & 0b0000_0010) >> 1) == 1,
-        ];
-        let slot_info_undefined = data[4] & 0b0000_0001;
+impl From<Vec<u8>> for TSMFHeaderPacket {
+    fn from(data: Vec<u8>) -> Self {
+        // ペイロードが短い場合のガード
+        assert!(data.len() >= 184, "TSMFヘッダが短すぎる: {}バイト", data.len());
 
-        let mut relative_stream_info = [0u32; 15];
-        for i in 0..15 {
-            relative_stream_info[i] =
-                u32::from_be_bytes(data[5 + 4 * i..9 + 4 * i].try_into().unwrap());
-        } // 64
+        let frame_sync = ((data[0] as u16 & 0b0001_1111) << 8) | data[1] as u16;
+        let version_number = (data[2] & 0b1110_0000) >> 5;
+        let relative_stream_number_mode = ((data[2] & 0b0001_0000) >> 4) == 1;
+        let frame_type = data[2] & 0b0000_1111;
 
-        let mut relative_stream_reception_info = [0u8; 15];
-        for i in 0..15 {
-            relative_stream_reception_info[i] =
-                (data[65 + i / 4] & (0b1100_0000 >> (2 * (i % 4)))) >> (6 - 2 * (i % 4)); // ?
+        // stream_status[15]: byte3の上位8bit + byte4の上位7bit
+        let mut stream_status = [false; 15];
+        for i in 0..8 {
+            stream_status[i] = ((data[3] >> (7 - i)) & 1) == 1;
+        }
+        for i in 0..7 {
+            stream_status[8 + i] = ((data[4] >> (7 - i)) & 1) == 1;
         }
 
-        let transmission_control_undefined = (data[68] & 0b0000_0010) >> 1;
-        let emergency_warning_info = data[68] & 0b0000_0001;
-        // 68
+        // stream_id[15] + original_network_id[15]: byte5-64 (60bytes)
+        let mut stream_id = [0u16; 15];
+        let mut original_network_id = [0u16; 15];
+        for i in 0..15 {
+            let base = 5 + i * 4;
+            stream_id[i] = u16::from_be_bytes([data[base], data[base + 1]]);
+            original_network_id[i] = u16::from_be_bytes([data[base + 2], data[base + 3]]);
+        }
 
-        let mut relative_stream_correspondence = [0u8; 52];
+        // receive_status[15]: 2bits×15=30bits → byte65-68の途中
+        let mut receive_status = [0u8; 15];
+        for i in 0..15 {
+            let byte_idx = 65 + i / 4;
+            let shift = 6 - 2 * (i % 4);
+            receive_status[i] = (data[byte_idx] >> shift) & 0b11;
+        }
+
+        // byte68: [...reserved(1)][emergency_indicator(1)][reserved(1)][reserved(1)]
+        // 30bits消費後の残り: byte67の下位2bit + byte68
+        // 30bits = 7bytes + 6bits なので byte65+7=72? → 要確認
+        // とりあえず元のコードの位置を踏襲
+        let emergency_indicator = ((data[68] & 0b0000_0010) >> 1) == 1;
+
+        // relative_stream_number[52]: 4bits×52=208bits=26bytes → byte69-94
+        let mut relative_stream_number = [0u8; 52];
         for i in 0..26 {
-            relative_stream_correspondence[i * 2] = (data[69 + i] & 0b1111_0000) >> 4;
-            relative_stream_correspondence[i * 2 + 1] = data[69 + i] & 0b0000_1111;
+            relative_stream_number[i * 2] = (data[69 + i] & 0b1111_0000) >> 4;
+            relative_stream_number[i * 2 + 1] = data[69 + i] & 0b0000_1111;
         }
 
-        // let extended_information: [u8; 85] = data[95..180].try_into().unwrap();
+        // earthquake_early_warning: 204bits → byte95-120 (上位4bitが最後の4bit)
+        let earthquake_early_warning: [u8; 26] = data[95..121].try_into().unwrap();
+        // byte120の下位4bit: '0000' padding
 
-        let earthquake_warning_information: [u8; 26] = data[95..121].try_into().unwrap();
-        let stream_type = ((data[121] as u16) << 7) & ((data[122] & 0b1111_1110) >> 1) as u16;
-        let stream_type_unused_0 = data[122] & 0b0000_0001;
-        let streams_identification = data[123];
-        let streams_count = data[124];
-        let streams_order = data[125];
-        let frame_count = (data[126] & 0b1111_0000) >> 4;
-        let frame_location = data[126] & 0b0000_1111;
-        let extension_field: [u8; 53] = data[127..180].try_into().unwrap();
+        // stream_type[15]: byte121-122
+        // byte121: stream_type[0..7] (8bits)
+        // byte122: stream_type[8..14] (7bits) + '0' padding (1bit)
+        let mut stream_type = [false; 15];
+        for i in 0..8 {
+            stream_type[i] = ((data[121] >> (7 - i)) & 1) == 1;
+        }
+        for i in 0..7 {
+            stream_type[8 + i] = ((data[122] >> (7 - i)) & 1) == 1;
+        }
 
-        let crc = ((data[180] as u32) << 24)
-            | ((data[181] as u32) << 16)
-            | ((data[182] as u32) << 8)
-            | data[183] as u32;
+        let group_id = data[123];
+        let number_of_carriers = data[124];
+        let carrier_sequence = data[125];
+        let number_of_frames = (data[126] & 0b1111_0000) >> 4;
+        let frame_position = data[126] & 0b0000_1111;
+
+        let crc = u32::from_be_bytes([data[180], data[181], data[182], data[183]]);
 
         Self {
-            sync_signal_unused,
-            sync_signal,
-            alter_indicator,
-            slot_info_indicator,
-            multi_frame_type,
-            relative_stream_enabled,
-            slot_info_undefined,
-            relative_stream_info,
-            relative_stream_reception_info,
-            transmission_control_undefined,
-            emergency_warning_info,
-            relative_stream_correspondence,
-            earthquake_warning_information,
+            frame_sync,
+            version_number,
+            relative_stream_number_mode,
+            frame_type,
+            stream_status,
+            stream_id,
+            original_network_id,
+            receive_status,
+            emergency_indicator,
+            relative_stream_number,
+            earthquake_early_warning,
             stream_type,
-            streams_identification,
-            streams_count,
-            streams_order,
-            frame_count,
-            frame_location,
-            extension_field,
+            group_id,
+            number_of_carriers,
+            carrier_sequence,
+            number_of_frames,
+            frame_position,
             crc,
         }
     }
