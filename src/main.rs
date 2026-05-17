@@ -28,6 +28,8 @@ const PAYLOAD_START: usize = 3;
 // live用。まず各入力で fp=0 をこの数だけ貯めてから同期探索する。
 const LIVE_FP0_CANDIDATES_TO_BUFFER: usize = 64;
 const LIVE_BAD_RESYNC_THRESHOLD: u64 = 200;
+const LIVE_RESYNC_MIN_FP0: usize = 24;
+const LIVE_RESYNC_DROP_OLD_FRAMES: usize = 32;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -623,7 +625,7 @@ fn run_live_mode(inputs: Vec<String>) {
 
         superframe_count += 1;
 
-        if superframe_count % 100 == 0 {
+        if superframe_count.is_multiple_of(100) {
             let st = out.stats();
 
             eprintln!(
@@ -640,15 +642,87 @@ fn run_live_mode(inputs: Vec<String>) {
 
             if bad_delta > LIVE_BAD_RESYNC_THRESHOLD || resync_delta > LIVE_BAD_RESYNC_THRESHOLD {
                 eprintln!(
-                    "warning: live stream may be out of sync: bad_delta={} resync_delta={}",
+                    "live resync triggered: bad_delta={} resync_delta={}",
                     bad_delta,
                     resync_delta
                 );
-                eprintln!("current version only warns; automatic resync can be added next");
+
+                perform_live_resync(&rx, &mut buffers);
+
+                /*
+                 * 壊れた途中TLVやReassembler内部状態を捨てる。
+                 * stdout自体は維持する。
+                 */
+                out.reset_state();
+
+                last_bad = 0;
+                last_resync = 0;
+
+                eprintln!("live resync done");
             }
         }
     }
 }
+
+
+fn perform_live_resync(rx: &mpsc::Receiver<LiveMessage>, buffers: &mut [LiveBuffer]) {
+    eprintln!("perform_live_resync: dropping old frames");
+
+    /*
+     * drop直後のフレームは、3波のうちどれかが欠けていたり、
+     * TLV断片の途中から始まっている可能性が高いので少し捨てる。
+     */
+    for b in buffers.iter_mut() {
+        let drop_count = b.frames.len().min(LIVE_RESYNC_DROP_OLD_FRAMES);
+
+        for _ in 0..drop_count {
+            b.frames.pop_front();
+        }
+    }
+
+    eprintln!(
+        "perform_live_resync: buffering until each stream has {} fp=0 candidates",
+        LIVE_RESYNC_MIN_FP0
+    );
+
+    while !live_buffers_ready(buffers, LIVE_RESYNC_MIN_FP0) {
+        recv_live_frame_into_buffers(rx, buffers);
+    }
+
+    /*
+     * carrier_sequence順に戻してから同期探索する。
+     */
+    buffers.sort_by_key(|b| b.carrier_sequence.unwrap_or(255));
+
+    eprintln!("perform_live_resync: buffer summary before search:");
+    for b in buffers.iter() {
+        eprintln!(
+            "  source={} carrier={:?} frames={} fp0={}",
+            b.source_idx,
+            b.carrier_sequence,
+            b.frames.len(),
+            count_fp0_in_deque(&b.frames)
+        );
+    }
+
+    let best = find_best_live_sync(buffers);
+
+    eprintln!("perform_live_resync: best sync:");
+    eprintln!("  score={}", best.score);
+    eprintln!("  payload_start={}", best.payload_start);
+    eprintln!("  indices={:?}", best.indices);
+    eprintln!("  stats={:?}", best.stats);
+
+    /*
+     * 採用位置より前を捨てる。
+     */
+    for (i, idx) in best.indices.iter().enumerate() {
+        for _ in 0..*idx {
+            buffers[i].frames.pop_front();
+        }
+    }
+}
+
 
 fn open_live_input(input: &str) -> io::Result<Box<dyn Read + Send>> {
     if input.starts_with("http://") || input.starts_with("https://") {
@@ -1547,6 +1621,13 @@ impl TlvReassembler {
         self.aligned = false;
         self.buf.clear();
         self.stats.remaining_buf = 0;
+    }
+
+    fn reset_state(&mut self) {
+        self.aligned = false;
+        self.buf.clear();
+        self.stats = TlvStats::default();
+        self.type_counts.clear();
     }
 
     fn finish(&mut self) {
