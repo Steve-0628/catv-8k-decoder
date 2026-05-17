@@ -1,335 +1,739 @@
 use std::{
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
+    path::PathBuf,
 };
 
+const TS_PACKET_SIZE: usize = 188;
+const DATA_SLOTS_PER_TSMF: usize = 52;
+const MAX_RSN: usize = 16;
+
+// 全部やるなら None
+// const LIMIT_SUPER_FRAMES: Option<u64> = Some(1000);
+const LIMIT_SUPER_FRAMES: Option<u64> = None;
+
+
+const PID_EXTENDED_TSMF_HEADER: u16 = 0x002f;
+const PID_SPLIT_TLV: u16 = 0x002d;
+
 fn main() {
-    // ./in/ 以下のTSファイルを全部読む
-    let mut paths: Vec<_> = std::fs::read_dir("./in")
+    let mut paths: Vec<PathBuf> = std::fs::read_dir("./in")
         .unwrap()
         .map(|p| p.unwrap().path())
         .collect();
-    paths.sort(); // ファイル名順にソート（念のため）
 
-    // まず各ファイルの frame_position=0 を探して位相を合わせる
+    paths.sort();
+
+    if paths.is_empty() {
+        panic!("./in/ にTSファイルがありません");
+    }
+
+    eprintln!("input files:");
+    for path in &paths {
+        eprintln!("  {:?}", path);
+    }
+
     let mut streams: Vec<StreamState> = paths
         .iter()
-        .map(|path| {
-            let mut file = File::open(path).unwrap();
-            let mut buf = [0u8; 188];
-            let mut offset: u64 = 0;
-
-            loop {
-                file.seek(SeekFrom::Start(offset)).unwrap();
-                if file.read_exact(&mut buf).is_err() {
-                    panic!("frame_position=0 が見つからなかった: {:?}", path);
-                }
-                let packet = TSPacket::from(buf);
-                if packet.pid == 0x2f {
-                    let tsmf = TSMFHeaderPacket::from(packet.payload);
-                    if tsmf.frame_position == 0 {
-                        println!(
-                            "{:?}: carrier_sequence={} number_of_carriers={} number_of_frames={} frame_position={}",
-                            path,
-                            tsmf.carrier_sequence,
-                            tsmf.number_of_carriers,
-                            tsmf.number_of_frames,
-                            tsmf.frame_position
-                        );
-                        return StreamState {
-                            carrier_sequence: tsmf.carrier_sequence,
-                            number_of_frames: tsmf.number_of_frames,
-                            offset,
-                            file,
-                        };
-                    }
-                }
-                offset += 188;
-            }
-        })
+        .map(open_and_sync_to_frame0)
         .collect();
 
-    // carrier_sequence 順にソート
     streams.sort_by_key(|s| s.carrier_sequence);
 
+    eprintln!("synced streams:");
+    for s in &streams {
+        eprintln!(
+            "  {:?}: carrier_sequence={} number_of_carriers={} number_of_frames={} offset={}",
+            s.path,
+            s.carrier_sequence,
+            s.number_of_carriers,
+            s.number_of_frames,
+            s.offset
+        );
+    }
+
     let n_carriers = streams.len();
-    // number_of_frames は全波共通のはずだが、念のため最初のストリームから取る
-    let number_of_frames = streams[0].number_of_frames as usize;
+    let n_frames = streams[0].number_of_frames as usize;
 
-    println!(
-        "搬送波数: {}, number_of_frames: {}",
-        n_carriers, number_of_frames
-    );
+    if n_frames != 3 && n_frames != 4 {
+        panic!("number_of_frames が仕様外です: {}", n_frames);
+    }
 
-    let mut outfile = File::create("out.mmts").unwrap();
+    eprintln!("n_carriers={} n_frames={}", n_carriers, n_frames);
 
-    // スーパーフレームは256QAMなので拡張TSMF×4
-    // サブフレームは53個/スーパーフレーム
-    // 各サブフレーム = number_of_frames 個のスロット
-    //
-    // 合成順: サブフレーム単位で、各搬送波の対応するスロット群を
-    // carrier_sequence 順に並べる
-    //
-    // 実装方針:
-    // 各ストリームから TSパケットを順番に読んでいき、
-    // 0x2d (TLVペイロード) を number_of_frames 個ずつ取り出して
-    // carrier_sequence 順に outfile に書く
+    let mut out_rsn_01 = TlvReassembler::new(File::create("out_rsn_01.mmts").unwrap());
 
-    // 'outer: loop {
-    //     // 各搬送波から number_of_frames 個の 0x2d パケットを集める
-    //     // let mut subframes: Vec<Vec<Vec<u8>>> = vec![Vec::new(); n_carriers];
+    let mut super_frame_count: u64 = 0;
 
-    //     // for (i, stream) in streams.iter_mut().enumerate() {
-    //     let mut i = 1;
-    //     loop {
-    //         // let mut collected = 0;
-    //         // let mut stream = streams[i];
-    //         let mut buf = [0u8; 188];
-
-    //         loop {
-    //             streams[i].file.seek(SeekFrom::Start(streams[i].offset)).unwrap();
-    //             if streams[i].file.read_exact(&mut buf).is_err() {
-    //                 // EOF
-    //                 break 'outer;
-    //             }
-    //             streams[i].offset += 188;
-
-    //             let packet = TSPacket::from(buf);
-    //             match packet.pid {
-    //                 0x2f => {
-    //                     // TSMFヘッダ: このサブフレームの区切りとして使う
-    //                     // number_of_frames 個集まったら次の搬送波へ
-    //                     // if collected >= number_of_frames {
-    //                     //     break;
-    //                     // }
-    //                     // まだ集まっていなければ読み飛ばして続ける 
-    //                     break;
-    //                 }
-    //                 0x2d => {
-    //                     let payload = extract_payload(&packet);
-    //                     // subframes[i].push(payload);
-    //                     // collected += 1;
-    //                     // if collected >= number_of_frames {
-    //                     //     break;
-    //                     // }
-    //                     let _ = outfile.write(&payload).unwrap();
-    //                 }
-    //                 _ => {}
-    //             }
-    //         }
-    //         i %= 3;
-    //         i+=1;
-
-    //     }
-
-    //     // carrier_sequence 順 (= streams のソート済み順) に書き出す
-    //     // for payloads in &subframes {
-    //     //     for payload in payloads {
-    //     //         outfile.write_all(payload).unwrap();
-    //     //     }
-    //     // }
-    // }
-    let mut super_frame_count = 0;
     'outer: loop {
+        /*
+         * superframe[frame_position][carrier_index]
+         *
+         * 1搬送波につき number_of_frames 個の拡張TSMFを読む。
+         * 256QAMなら 4個。
+         * 64QAMなら 3個。
+         */
+        let mut superframe: Vec<Vec<TsmfFrame>> = (0..n_frames)
+            .map(|_| Vec::with_capacity(n_carriers))
+            .collect();
+
         for stream in streams.iter_mut() {
-            let mut buf = [0u8; 188];
-            loop {
-                if stream.file.read_exact(&mut buf).is_err() {
+            for _ in 0..n_frames {
+                let frame = match read_one_tsmf_frame(stream) {
+                    Some(f) => f,
+                    None => break 'outer,
+                };
+
+                let fp = frame.header.frame_position as usize;
+
+                if fp >= n_frames {
+                    eprintln!(
+                        "invalid frame_position={} carrier={}",
+                        frame.header.frame_position,
+                        frame.header.carrier_sequence
+                    );
                     break 'outer;
                 }
-                let packet = TSPacket::from(buf);
-                match packet.pid {
-                    0x2f => {
-                        let tsmf = TSMFHeaderPacket::from(packet.payload.clone());
-                        eprintln!("stream {} frame_position={}", stream.carrier_sequence, tsmf.frame_position);
-                        if tsmf.frame_position == 3 {
-                            super_frame_count += 1;
-                        }
-                        break;
-                    }
-                    0x2d => {
-                        outfile.write_all(&packet.payload).unwrap();
-                    }
-                    _ => {}
+
+                superframe[fp].push(frame);
+            }
+        }
+
+        for fp in 0..n_frames {
+            superframe[fp].sort_by_key(|f| f.header.carrier_sequence);
+
+            if superframe[fp].len() != n_carriers {
+                eprintln!(
+                    "frame_position={} has {} carriers, expected {}",
+                    fp,
+                    superframe[fp].len(),
+                    n_carriers
+                );
+                break 'outer;
+            }
+        }
+
+        if super_frame_count % 100 == 0 {
+            eprintln!("super_frame_count={}", super_frame_count);
+
+            for fp in 0..n_frames {
+                eprintln!("  frame_position={}", fp);
+
+                for f in &superframe[fp] {
+                    eprintln!(
+                        "    carrier={} group_id={} rsn[0..16]={:?} stream_type[0..15]={:?}",
+                        f.header.carrier_sequence,
+                        f.header.group_id,
+                        &f.header.relative_stream_number[0..16],
+                        &f.header.stream_type
+                    );
                 }
             }
         }
-        if super_frame_count >= 1 {
-            break;
+
+        /*
+         * 総務省資料 4.7.2 の順序:
+         *
+         *   subframe
+         *     slot_position
+         *       carrier_sequence
+         *
+         * ここでは、各データスロットに対して、
+         *
+         *   full_slot_index = frame_position * 53 + slot_index
+         *
+         * とする。
+         *
+         * slot_index は:
+         *   0      = 拡張TSMFヘッダスロット
+         *   1..52  = データスロット
+         *
+         * なので、relative_stream_number[0] に対応するスロットは slot_index=1。
+         */
+        let mut ordered_slots: Vec<OrderedSlot> = Vec::new();
+
+        for fp in 0..n_frames {
+            for carrier_idx in 0..n_carriers {
+                let frame = &superframe[fp][carrier_idx];
+
+                for data_slot_idx in 0..DATA_SLOTS_PER_TSMF {
+                    let slot_index_in_tsmf = data_slot_idx + 1;
+                    let full_slot_index = fp * 53 + slot_index_in_tsmf;
+
+                    let subframe = full_slot_index / n_frames;
+                    let slot_position = full_slot_index % n_frames;
+
+                    let rsn = frame.header.relative_stream_number[data_slot_idx];
+
+                    if rsn == 0 {
+                        continue;
+                    }
+
+                    let rsn_idx = (rsn - 1) as usize;
+
+                    if rsn_idx >= frame.header.stream_type.len() {
+                        continue;
+                    }
+
+                    let is_tlv = frame.header.stream_type[rsn_idx] == StreamKind::Tlv;
+
+                    if !is_tlv {
+                        continue;
+                    }
+
+                    ordered_slots.push(OrderedSlot {
+                        subframe,
+                        slot_position,
+                        carrier_sequence: frame.header.carrier_sequence,
+                        rsn,
+                        packet: frame.slots[data_slot_idx],
+                    });
+                }
+            }
+        }
+
+        ordered_slots.sort_by_key(|s| {
+            (
+                s.subframe,
+                s.slot_position,
+                s.carrier_sequence,
+            )
+        });
+
+        for s in ordered_slots {
+            if super_frame_count < 2 {
+                eprintln!(
+                    "sf={} sp={} carrier={} rsn={} head={:02X} {:02X} {:02X} {:02X}",
+                    s.subframe,
+                    s.slot_position,
+                    s.carrier_sequence,
+                    s.rsn,
+                    s.packet[0],
+                    s.packet[1],
+                    s.packet[2],
+                    s.packet[3],
+                );
+            }
+
+            if s.rsn == 1 {
+                out_rsn_01.feed_split_tlv_packet(&s.packet);
+            }
+        }
+
+        super_frame_count += 1;
+
+        if let Some(limit) = LIMIT_SUPER_FRAMES
+            && super_frame_count >= limit {
+                break;
+            }
+    }
+
+    out_rsn_01.finish();
+
+    eprintln!("done: super_frame_count={}", super_frame_count);
+    eprintln!("generated:");
+    eprintln!("  out_tlv_all.mmts");
+    eprintln!("  out_rsn_00.mmts ... out_rsn_15.mmts");
+}
+
+fn open_and_sync_to_frame0(path: &PathBuf) -> StreamState {
+    let mut file = File::open(path).unwrap();
+    let mut buf = [0u8; TS_PACKET_SIZE];
+
+    let mut offset: u64 = 0;
+
+    loop {
+        file.seek(SeekFrom::Start(offset)).unwrap();
+
+        if file.read_exact(&mut buf).is_err() {
+            panic!("frame_position=0 が見つからなかった: {:?}", path);
+        }
+
+        let pid = packet_pid(&buf);
+
+        if pid == PID_EXTENDED_TSMF_HEADER {
+            let header = ExtendedTsmfHeader::parse(&buf);
+
+            if header.frame_position == 0 {
+                eprintln!(
+                    "{:?}: synced carrier_sequence={} number_of_carriers={} number_of_frames={} frame_position={} offset={}",
+                    path,
+                    header.carrier_sequence,
+                    header.number_of_carriers,
+                    header.number_of_frames,
+                    header.frame_position,
+                    offset
+                );
+
+                file.seek(SeekFrom::Start(offset)).unwrap();
+
+                return StreamState {
+                    path: path.clone(),
+                    file,
+                    offset,
+                    carrier_sequence: header.carrier_sequence,
+                    number_of_carriers: header.number_of_carriers,
+                    number_of_frames: header.number_of_frames,
+                };
+            }
+        }
+
+        offset += TS_PACKET_SIZE as u64;
+    }
+}
+
+fn read_one_tsmf_frame(stream: &mut StreamState) -> Option<TsmfFrame> {
+    let mut buf = [0u8; TS_PACKET_SIZE];
+
+    let header = loop {
+        let packet_offset = stream.offset;
+
+        if stream.file.read_exact(&mut buf).is_err() {
+            return None;
+        }
+
+        stream.offset += TS_PACKET_SIZE as u64;
+
+        let pid = packet_pid(&buf);
+
+        if pid == PID_EXTENDED_TSMF_HEADER {
+            let h = ExtendedTsmfHeader::parse(&buf);
+
+            if h.carrier_sequence != stream.carrier_sequence {
+                eprintln!(
+                    "carrier_sequence mismatch: stream={} header={} offset={}",
+                    stream.carrier_sequence,
+                    h.carrier_sequence,
+                    packet_offset
+                );
+            }
+
+            break h;
+        }
+    };
+
+    let mut slots: Vec<[u8; 188]> = Vec::with_capacity(DATA_SLOTS_PER_TSMF);
+
+    while slots.len() < DATA_SLOTS_PER_TSMF {
+        let packet_offset = stream.offset;
+
+        if stream.file.read_exact(&mut buf).is_err() {
+            return None;
+        }
+
+        stream.offset += TS_PACKET_SIZE as u64;
+
+        let pid = packet_pid(&buf);
+
+        match pid {
+            PID_SPLIT_TLV => {
+                slots.push(buf);
+            }
+
+            PID_EXTENDED_TSMF_HEADER => {
+                eprintln!(
+                    "next 0x2F came before 52 slots: carrier={} frame_position={} slots={} offset={}",
+                    stream.carrier_sequence,
+                    header.frame_position,
+                    slots.len(),
+                    packet_offset
+                );
+
+                stream.file.seek(SeekFrom::Start(packet_offset)).unwrap();
+                stream.offset = packet_offset;
+
+                return None;
+            }
+
+            _ => {}
         }
     }
 
-    // println!("{:?}", count);
-    eprintln!("完了");
+    Some(TsmfFrame { header, slots })
 }
 
-/// TSパケットからペイロードを取り出す (adaptation field を考慮)
-// fn extract_payload(packet: &TSPacket) -> Vec<u8> {
-//     if packet.payload_unit_start_indicator && !packet.payload.is_empty() {
-//         packet.payload[1..].to_vec()
-//     } else {
-//         packet.payload.to_vec()
-//     }
-// }
+fn packet_pid(data: &[u8; 188]) -> u16 {
+    if data[0] != 0x47 {
+        eprintln!(
+            "sync byte mismatch: {:02X} {:02X} {:02X} {:02X}",
+            data[0], data[1], data[2], data[3]
+        );
+    }
 
-struct StreamState {
-    carrier_sequence: u8,
-    number_of_frames: u8,
-    offset: u64,
-    file: File,
+    ((data[1] as u16 & 0x1f) << 8) | data[2] as u16
 }
 
-struct TSPacket {
-    pid: u16,
-    payload_unit_start_indicator: bool,
-    payload: Vec<u8>,
+fn packet_start_indicator(data: &[u8; 188]) -> bool {
+    (data[1] & 0x40) != 0
 }
 
-impl From<[u8; 188]> for TSPacket {
-    fn from(data: [u8; 188]) -> Self {
-        let pid = ((data[1] as u16 & 0b0001_1111) << 8) | data[2] as u16;
-        let payload_unit_start_indicator = ((data[1] & 0b0100_0000) >> 6) == 1;
-        let adaptation_field_control = (data[3] & 0b0011_0000) >> 4;
+/*
+ * 分割TLVパケット → 生TLVストリーム復元
+ *
+ * 分割TLVパケット構造:
+ *
+ *   byte 0      : 0x47
+ *   byte 1..2   : TEI / TLV packet start indicator / '0' / PID
+ *   byte 3..187 : payload 185B
+ *
+ * TLV packet start indicator が 1 のとき:
+ *
+ *   payload[0] が「先頭TLV指示」
+ *   payload[1..] が実データ
+ *
+ * 以前の data[4..] 固定は、start indicator=0 のパケットで
+ * payload先頭1バイトを毎回捨てるので壊れる。
+ */
+struct TlvReassembler {
+    out: File,
+    aligned: bool,
+    packet_count: u64,
+    start_count: u64,
+}
 
-        // adaptation field を考慮してペイロード開始位置を決める
-        let payload_start = match adaptation_field_control {
-            0b10 => {
-                // adaptation fieldのみ、ペイロードなし
-                188 // 空
-            }
-            0b11 => {
-                // adaptation field + payload
-                let af_len = data[4] as usize;
-                5 + af_len // 4バイトヘッダ + 1バイト長さフィールド + adaptation field本体
-            }
-            _ => {
-                // 0b01: ペイロードのみ
-                4
-            }
-        };
-        // let payload: Vec<u8> = if payload_unit_start_indicator { data[4..].to_vec() } else { data[3..].to_vec() };
-        let payload = data[4..].to_vec();
+impl TlvReassembler {
+    fn new(out: File) -> Self {
         Self {
-            pid,
-            payload_unit_start_indicator,
-            payload,
+            out,
+            aligned: false,
+            packet_count: 0,
+            start_count: 0,
         }
+    }
+
+    fn feed_split_tlv_packet(&mut self, packet: &[u8; 188]) {
+        self.packet_count += 1;
+
+        if packet[0] != 0x47 {
+            eprintln!("split TLV sync mismatch: {:02X}", packet[0]);
+            return;
+        }
+
+        let pid = packet_pid(packet);
+        if pid != PID_SPLIT_TLV {
+            return;
+        }
+
+        let payload = &packet[3..188];
+        let start = packet_start_indicator(packet);
+
+        if start {
+            self.start_count += 1;
+
+            let pointer = payload[0] as usize;
+
+            if pointer > 184 {
+                eprintln!("bad first_tlv_pointer={}", pointer);
+                return;
+            }
+
+            if !self.aligned {
+                /*
+                 * 最初だけは、前のTLVパケットの尻尾を捨てる。
+                 * pointerの位置から最初の完全なTLVが始まる。
+                 */
+                let begin = 1 + pointer;
+                self.out.write_all(&payload[begin..]).unwrap();
+                self.aligned = true;
+            } else {
+                /*
+                 * すでに同期済みなら、pointer前のバイトも前TLVの続きなので捨てない。
+                 * pointer byte 自体だけを除いて payload[1..] を全部出す。
+                 */
+                self.out.write_all(&payload[1..]).unwrap();
+            }
+        } else {
+            if self.aligned {
+                self.out.write_all(payload).unwrap();
+            }
+        }
+    }
+
+    fn finish(&mut self) {
+        eprintln!(
+            "tlv reassembler: packets={} starts={} aligned={}",
+            self.packet_count,
+            self.start_count,
+            self.aligned
+        );
     }
 }
 
 #[derive(Debug)]
-struct TSMFHeaderPacket {
+struct StreamState {
+    path: PathBuf,
+    file: File,
+    offset: u64,
+    carrier_sequence: u8,
+    number_of_carriers: u8,
+    number_of_frames: u8,
+}
+
+#[derive(Debug)]
+struct TsmfFrame {
+    header: ExtendedTsmfHeader,
+    slots: Vec<[u8; 188]>,
+}
+
+#[derive(Clone, Copy)]
+struct OrderedSlot {
+    subframe: usize,
+    slot_position: usize,
+    carrier_sequence: u8,
+    rsn: u8,
+    packet: [u8; 188],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamKind {
+    Tlv,
+    TsOrNone,
+}
+
+#[derive(Debug, Clone)]
+struct ExtendedTsmfHeader {
+    frame_pid: u16,
+    continuity_counter: u8,
+
     frame_sync: u16,
     version_number: u8,
     relative_stream_number_mode: bool,
     frame_type: u8,
+
     stream_status: [bool; 15],
     stream_id: [u16; 15],
     original_network_id: [u16; 15],
     receive_status: [u8; 15],
     emergency_indicator: bool,
+
     relative_stream_number: [u8; 52],
-    earthquake_early_warning: [u8; 26],
-    stream_type: [bool; 15],
+
+    stream_type: [StreamKind; 15],
+
     group_id: u8,
     number_of_carriers: u8,
     carrier_sequence: u8,
     number_of_frames: u8,
     frame_position: u8,
+
     crc: u32,
 }
 
-impl From<Vec<u8>> for TSMFHeaderPacket {
-    fn from(data: Vec<u8>) -> Self {
-        // ペイロードが短い場合のガード
-        assert!(data.len() >= 184, "TSMFヘッダが短すぎる: {}バイト", data.len());
+impl ExtendedTsmfHeader {
+    fn parse(data: &[u8; 188]) -> Self {
+        let mut r = BitReader::new(data);
 
-        let frame_sync = ((data[0] as u16 & 0b0001_1111) << 8) | data[1] as u16;
-        let version_number = (data[2] & 0b1110_0000) >> 5;
-        let relative_stream_number_mode = ((data[2] & 0b0001_0000) >> 4) == 1;
-        let frame_type = data[2] & 0b0000_1111;
+        let sync_byte = r.read_u8(8);
+        assert_eq!(sync_byte, 0x47, "Extended TSMF sync_byte != 0x47");
 
-        // stream_status[15]: byte3の上位8bit + byte4の上位7bit
+        let fixed_000 = r.read_u8(3);
+        if fixed_000 != 0 {
+            eprintln!("warning: TSMF header fixed '000' is {}", fixed_000);
+        }
+
+        let frame_pid = r.read_u16(13);
+
+        let fixed_0001 = r.read_u8(4);
+        if fixed_0001 != 0b0001 {
+            eprintln!("warning: TSMF header fixed '0001' is {:04b}", fixed_0001);
+        }
+
+        let continuity_counter = r.read_u8(4);
+
+        let _reserved_3 = r.read_u8(3);
+
+        let frame_sync = r.read_u16(13);
+        let version_number = r.read_u8(3);
+        let relative_stream_number_mode = r.read_bool();
+        let frame_type = r.read_u8(4);
+
         let mut stream_status = [false; 15];
-        for i in 0..8 {
-            stream_status[i] = ((data[3] >> (7 - i)) & 1) == 1;
-        }
-        for i in 0..7 {
-            stream_status[8 + i] = ((data[4] >> (7 - i)) & 1) == 1;
+        for i in 0..15 {
+            stream_status[i] = r.read_bool();
         }
 
-        // stream_id[15] + original_network_id[15]: byte5-64 (60bytes)
+        let _reserved_1 = r.read_bool();
+
         let mut stream_id = [0u16; 15];
         let mut original_network_id = [0u16; 15];
+
         for i in 0..15 {
-            let base = 5 + i * 4;
-            stream_id[i] = u16::from_be_bytes([data[base], data[base + 1]]);
-            original_network_id[i] = u16::from_be_bytes([data[base + 2], data[base + 3]]);
+            stream_id[i] = r.read_u16(16);
+            original_network_id[i] = r.read_u16(16);
         }
 
-        // receive_status[15]: 2bits×15=30bits → byte65-68の途中
         let mut receive_status = [0u8; 15];
+
         for i in 0..15 {
-            let byte_idx = 65 + i / 4;
-            let shift = 6 - 2 * (i % 4);
-            receive_status[i] = (data[byte_idx] >> shift) & 0b11;
+            receive_status[i] = r.read_u8(2);
         }
 
-        // byte68: [...reserved(1)][emergency_indicator(1)][reserved(1)][reserved(1)]
-        // 30bits消費後の残り: byte67の下位2bit + byte68
-        // 30bits = 7bytes + 6bits なので byte65+7=72? → 要確認
-        // とりあえず元のコードの位置を踏襲
-        let emergency_indicator = ((data[68] & 0b0000_0010) >> 1) == 1;
+        let _reserved_1b = r.read_bool();
+        let emergency_indicator = r.read_bool();
 
-        // relative_stream_number[52]: 4bits×52=208bits=26bytes → byte69-94
         let mut relative_stream_number = [0u8; 52];
-        for i in 0..26 {
-            relative_stream_number[i * 2] = (data[69 + i] & 0b1111_0000) >> 4;
-            relative_stream_number[i * 2 + 1] = data[69 + i] & 0b0000_1111;
+
+        for i in 0..52 {
+            relative_stream_number[i] = r.read_u8(4);
         }
 
-        // earthquake_early_warning: 204bits → byte95-120 (上位4bitが最後の4bit)
-        let earthquake_early_warning: [u8; 26] = data[95..121].try_into().unwrap();
-        // byte120の下位4bit: '0000' padding
+        let _earthquake_early_warning = r.read_bits_to_vec(204);
 
-        // stream_type[15]: byte121-122
-        // byte121: stream_type[0..7] (8bits)
-        // byte122: stream_type[8..14] (7bits) + '0' padding (1bit)
-        let mut stream_type = [false; 15];
-        for i in 0..8 {
-            stream_type[i] = ((data[121] >> (7 - i)) & 1) == 1;
-        }
-        for i in 0..7 {
-            stream_type[8 + i] = ((data[122] >> (7 - i)) & 1) == 1;
+        let fixed_0000 = r.read_u8(4);
+        if fixed_0000 != 0 {
+            eprintln!("warning: TSMF fixed '0000' is {:04b}", fixed_0000);
         }
 
-        let group_id = data[123];
-        let number_of_carriers = data[124];
-        let carrier_sequence = data[125];
-        let number_of_frames = (data[126] & 0b1111_0000) >> 4;
-        let frame_position = data[126] & 0b0000_1111;
+        let mut stream_type = [StreamKind::TsOrNone; 15];
 
-        let crc = u32::from_be_bytes([data[180], data[181], data[182], data[183]]);
+        for i in 0..15 {
+            let bit = r.read_bool();
+
+            stream_type[i] = if bit {
+                StreamKind::TsOrNone
+            } else {
+                StreamKind::Tlv
+            };
+        }
+
+        let fixed_0 = r.read_bool();
+        if fixed_0 {
+            eprintln!("warning: TSMF fixed '0' is 1");
+        }
+
+        let group_id = r.read_u8(8);
+        let number_of_carriers = r.read_u8(8);
+        let carrier_sequence = r.read_u8(8);
+        let number_of_frames = r.read_u8(4);
+        let frame_position = r.read_u8(4);
+
+        let _reserved_424 = r.read_bits_to_vec(424);
+
+        let crc = r.read_u32(32);
+
+        if frame_pid != PID_EXTENDED_TSMF_HEADER {
+            eprintln!("warning: frame_pid != 0x2F: 0x{:04X}", frame_pid);
+        }
 
         Self {
+            frame_pid,
+            continuity_counter,
+
             frame_sync,
             version_number,
             relative_stream_number_mode,
             frame_type,
+
             stream_status,
             stream_id,
             original_network_id,
             receive_status,
             emergency_indicator,
+
             relative_stream_number,
-            earthquake_early_warning,
             stream_type,
+
             group_id,
             number_of_carriers,
             carrier_sequence,
             number_of_frames,
             frame_position,
+
             crc,
         }
+    }
+}
+
+struct BitReader<'a> {
+    data: &'a [u8],
+    bit_pos: usize,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, bit_pos: 0 }
+    }
+
+    fn read_bool(&mut self) -> bool {
+        self.read_u8(1) != 0
+    }
+
+    fn read_u8(&mut self, bits: usize) -> u8 {
+        assert!(bits <= 8);
+
+        let mut v = 0u8;
+
+        for _ in 0..bits {
+            v <<= 1;
+            v |= self.read_bit();
+        }
+
+        v
+    }
+
+    fn read_u16(&mut self, bits: usize) -> u16 {
+        assert!(bits <= 16);
+
+        let mut v = 0u16;
+
+        for _ in 0..bits {
+            v <<= 1;
+            v |= self.read_bit() as u16;
+        }
+
+        v
+    }
+
+    fn read_u32(&mut self, bits: usize) -> u32 {
+        assert!(bits <= 32);
+
+        let mut v = 0u32;
+
+        for _ in 0..bits {
+            v <<= 1;
+            v |= self.read_bit() as u32;
+        }
+
+        v
+    }
+
+    fn read_bits_to_vec(&mut self, bits: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity((bits + 7) / 8);
+
+        let mut cur = 0u8;
+        let mut n = 0usize;
+
+        for _ in 0..bits {
+            cur <<= 1;
+            cur |= self.read_bit();
+            n += 1;
+
+            if n == 8 {
+                out.push(cur);
+                cur = 0;
+                n = 0;
+            }
+        }
+
+        if n != 0 {
+            cur <<= 8 - n;
+            out.push(cur);
+        }
+
+        out
+    }
+
+    fn read_bit(&mut self) -> u8 {
+        let byte_pos = self.bit_pos / 8;
+        let bit_in_byte = 7 - (self.bit_pos % 8);
+
+        if byte_pos >= self.data.len() {
+            panic!("BitReader overrun at bit_pos={}", self.bit_pos);
+        }
+
+        let bit = (self.data[byte_pos] >> bit_in_byte) & 1;
+        self.bit_pos += 1;
+
+        bit
     }
 }
