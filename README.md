@@ -66,7 +66,8 @@ cargo run --release -- --live http://host/a.ts http://host/b.ts http://host/c.ts
 
 - バイナリストリームは標準出力へ出ます
 - ログは標準エラーへ出ます
-- エラー率が一定以上に増えると自動で再同期を試みます
+- パケットドロップでフレームが欠けた場合は、TSMF ヘッダの continuity_counter の飛びと frame_position のズレで即座に検出し、自動で再同期します
+- 検出をすり抜けた劣化も、エラー率が一定以上に増えるとフォールバックで再同期します
 
 ## いまの制約
 
@@ -78,7 +79,7 @@ cargo run --release -- --live http://host/a.ts http://host/b.ts http://host/c.ts
 
 ## 実装メモ
 
-- 本体コードは [src/main.rs](/home/stesan/git/catv-8k-decoder/src/main.rs) にあります
+- 本体コードは [src/main.rs](src/main.rs) にあります
 - live mode では `ureq` を使って HTTP/HTTPS 入力を開きます
 - `target/`、`*.ts`、`*.mmts` は `.gitignore` 対象です
 

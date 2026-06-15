@@ -38,15 +38,13 @@ fn main() {
         if args.len() != 5 {
             eprintln!("usage:");
             eprintln!("  file mode: cargo run --release");
-            eprintln!("  live mode: cargo run --release -- --live <ts1|url1> <ts2|url2> <ts3|url3>");
+            eprintln!(
+                "  live mode: cargo run --release -- --live <ts1|url1> <ts2|url2> <ts3|url3>"
+            );
             std::process::exit(1);
         }
 
-        let inputs = vec![
-            args[2].clone(),
-            args[3].clone(),
-            args[4].clone(),
-        ];
+        let inputs = vec![args[2].clone(), args[3].clone(), args[4].clone()];
 
         run_live_mode(inputs);
     } else {
@@ -158,9 +156,10 @@ fn run_file_mode() {
         }
 
         if let Some(limit) = LIMIT_OUTPUT_SUPERFRAMES
-            && superframe_count >= limit {
-                break;
-            }
+            && superframe_count >= limit
+        {
+            break;
+        }
     }
 
     out.finish();
@@ -207,10 +206,7 @@ fn find_best_file_sync(candidate_lists: &[Vec<SyncCandidate>]) -> TrialResult {
 
     eprintln!(
         "fast sync search: base_index={} carrier1 fixed, carrier2/3 shift={}..{} payload_start={}",
-        BASE_INDEX,
-        -MAX_SHIFT,
-        MAX_SHIFT,
-        PAYLOAD_START
+        BASE_INDEX, -MAX_SHIFT, MAX_SHIFT, PAYLOAD_START
     );
 
     for s2 in -MAX_SHIFT..=MAX_SHIFT {
@@ -225,15 +221,16 @@ fn find_best_file_sync(candidate_lists: &[Vec<SyncCandidate>]) -> TrialResult {
 
             let indices = vec![i0 as usize, i1 as usize, i2 as usize];
 
-            if indices[1] >= candidate_lists[1].len()
-                || indices[2] >= candidate_lists[2].len()
-            {
+            if indices[1] >= candidate_lists[1].len() || indices[2] >= candidate_lists[2].len() {
                 continue;
             }
 
-            if let Some(result) =
-                run_file_trial(candidate_lists, &indices, PAYLOAD_START, FAST_TEST_SUPERFRAMES)
-            {
+            if let Some(result) = run_file_trial(
+                candidate_lists,
+                &indices,
+                PAYLOAD_START,
+                FAST_TEST_SUPERFRAMES,
+            ) {
                 results.push(result);
             }
         }
@@ -414,8 +411,7 @@ fn read_one_superframe_from_files(streams: &mut [FileStreamState]) -> Option<Vec
             if fp >= n_frames {
                 eprintln!(
                     "invalid frame_position={} carrier={}",
-                    frame.header.frame_position,
-                    frame.header.carrier_sequence
+                    frame.header.frame_position, frame.header.carrier_sequence
                 );
                 return None;
             }
@@ -447,9 +443,7 @@ fn read_one_tsmf_frame_from_file(stream: &mut FileStreamState) -> Option<TsmfFra
             if h.carrier_sequence != stream.carrier_sequence {
                 eprintln!(
                     "carrier_sequence mismatch: stream={} header={} offset={}",
-                    stream.carrier_sequence,
-                    h.carrier_sequence,
-                    packet_offset
+                    stream.carrier_sequence, h.carrier_sequence, packet_offset
                 );
             }
 
@@ -530,7 +524,10 @@ fn run_live_mode(inputs: Vec<String>) {
                         }
                     }
                     None => {
-                        eprintln!("live reader ended: source_idx={} input={}", source_idx, input);
+                        eprintln!(
+                            "live reader ended: source_idx={} input={}",
+                            source_idx, input
+                        );
                         break;
                     }
                 }
@@ -540,7 +537,6 @@ fn run_live_mode(inputs: Vec<String>) {
 
     drop(tx);
 
-
     let mut buffers: Vec<LiveBuffer> = inputs
         .iter()
         .enumerate()
@@ -549,6 +545,8 @@ fn run_live_mode(inputs: Vec<String>) {
             name: input.clone(),
             carrier_sequence: None,
             frames: VecDeque::new(),
+            last_header_cc: None,
+            cc_jump_positions: Vec::new(),
         })
         .collect();
 
@@ -580,7 +578,7 @@ fn run_live_mode(inputs: Vec<String>) {
         );
     }
 
-    let best = find_best_live_sync(&buffers);
+    let best = try_find_best_live_sync(&buffers).expect("no live sync candidate found at startup");
 
     eprintln!("best live sync:");
     eprintln!("  score={}", best.score);
@@ -591,17 +589,13 @@ fn run_live_mode(inputs: Vec<String>) {
     for (i, idx) in best.indices.iter().enumerate() {
         eprintln!(
             "  carrier={:?} source={} start_frame_index={}",
-            buffers[i].carrier_sequence,
-            buffers[i].source_idx,
-            idx
+            buffers[i].carrier_sequence, buffers[i].source_idx, idx
         );
     }
 
     // 採用位置より前を捨てる
     for (i, idx) in best.indices.iter().enumerate() {
-        for _ in 0..*idx {
-            buffers[i].frames.pop_front();
-        }
+        drop_front_frames(&mut buffers[i], *idx);
     }
 
     eprintln!("starting live output to stdout...");
@@ -619,7 +613,20 @@ fn run_live_mode(inputs: Vec<String>) {
             recv_live_frame_into_buffers(&rx, &mut buffers);
         }
 
-        let frames = pop_one_live_superframe(&mut buffers);
+        let frames = match pop_aligned_live_superframe(&mut buffers) {
+            Ok(frames) => frames,
+            Err(e) => {
+                eprintln!("live sync lost: {}", e);
+
+                perform_live_resync(&rx, &mut buffers);
+                out.reset_state();
+
+                last_bad = 0;
+                last_resync = 0;
+
+                continue;
+            }
+        };
 
         process_superframe_frames(frames, &mut out, TARGET_RSN);
 
@@ -628,11 +635,7 @@ fn run_live_mode(inputs: Vec<String>) {
         if superframe_count.is_multiple_of(100) {
             let st = out.stats();
 
-            eprintln!(
-                "live superframes={} stats={:?}",
-                superframe_count,
-                st
-            );
+            eprintln!("live superframes={} stats={:?}", superframe_count, st);
 
             let bad_delta = st.bad.saturating_sub(last_bad);
             let resync_delta = st.resync.saturating_sub(last_resync);
@@ -643,8 +646,7 @@ fn run_live_mode(inputs: Vec<String>) {
             if bad_delta > LIVE_BAD_RESYNC_THRESHOLD || resync_delta > LIVE_BAD_RESYNC_THRESHOLD {
                 eprintln!(
                     "live resync triggered: bad_delta={} resync_delta={}",
-                    bad_delta,
-                    resync_delta
+                    bad_delta, resync_delta
                 );
 
                 perform_live_resync(&rx, &mut buffers);
@@ -664,7 +666,6 @@ fn run_live_mode(inputs: Vec<String>) {
     }
 }
 
-
 fn perform_live_resync(rx: &mpsc::Receiver<LiveMessage>, buffers: &mut [LiveBuffer]) {
     eprintln!("perform_live_resync: dropping old frames");
 
@@ -673,11 +674,7 @@ fn perform_live_resync(rx: &mpsc::Receiver<LiveMessage>, buffers: &mut [LiveBuff
      * TLV断片の途中から始まっている可能性が高いので少し捨てる。
      */
     for b in buffers.iter_mut() {
-        let drop_count = b.frames.len().min(LIVE_RESYNC_DROP_OLD_FRAMES);
-
-        for _ in 0..drop_count {
-            b.frames.pop_front();
-        }
+        drop_front_frames(b, LIVE_RESYNC_DROP_OLD_FRAMES);
     }
 
     eprintln!(
@@ -685,27 +682,43 @@ fn perform_live_resync(rx: &mpsc::Receiver<LiveMessage>, buffers: &mut [LiveBuff
         LIVE_RESYNC_MIN_FP0
     );
 
-    while !live_buffers_ready(buffers, LIVE_RESYNC_MIN_FP0) {
-        recv_live_frame_into_buffers(rx, buffers);
-    }
+    let best = loop {
+        while !live_buffers_ready(buffers, LIVE_RESYNC_MIN_FP0) {
+            recv_live_frame_into_buffers(rx, buffers);
+        }
 
-    /*
-     * carrier_sequence順に戻してから同期探索する。
-     */
-    buffers.sort_by_key(|b| b.carrier_sequence.unwrap_or(255));
+        /*
+         * carrier_sequence順に戻してから同期探索する。
+         */
+        buffers.sort_by_key(|b| b.carrier_sequence.unwrap_or(255));
 
-    eprintln!("perform_live_resync: buffer summary before search:");
-    for b in buffers.iter() {
+        eprintln!("perform_live_resync: buffer summary before search:");
+        for b in buffers.iter() {
+            eprintln!(
+                "  source={} carrier={:?} frames={} fp0={}",
+                b.source_idx,
+                b.carrier_sequence,
+                b.frames.len(),
+                count_fp0_in_deque(&b.frames)
+            );
+        }
+
+        if let Some(best) = try_find_best_live_sync(buffers) {
+            break best;
+        }
+
+        /*
+         * 候補が見つからない場合は古いフレームを捨てて新しいデータで再挑戦する。
+         */
         eprintln!(
-            "  source={} carrier={:?} frames={} fp0={}",
-            b.source_idx,
-            b.carrier_sequence,
-            b.frames.len(),
-            count_fp0_in_deque(&b.frames)
+            "perform_live_resync: no candidate, dropping {} frames per stream and retrying",
+            LIVE_RESYNC_DROP_OLD_FRAMES
         );
-    }
 
-    let best = find_best_live_sync(buffers);
+        for b in buffers.iter_mut() {
+            drop_front_frames(b, LIVE_RESYNC_DROP_OLD_FRAMES);
+        }
+    };
 
     eprintln!("perform_live_resync: best sync:");
     eprintln!("  score={}", best.score);
@@ -714,15 +727,13 @@ fn perform_live_resync(rx: &mpsc::Receiver<LiveMessage>, buffers: &mut [LiveBuff
     eprintln!("  stats={:?}", best.stats);
 
     /*
-     * 採用位置より前を捨てる。
+     * 採用位置より前を捨てる。採用位置より後ろに残っている cc ジャンプは
+     * drop_front_frames が位置を保持するので、後続の pop で改めて検出される。
      */
     for (i, idx) in best.indices.iter().enumerate() {
-        for _ in 0..*idx {
-            buffers[i].frames.pop_front();
-        }
+        drop_front_frames(&mut buffers[i], *idx);
     }
 }
-
 
 fn open_live_input(input: &str) -> io::Result<Box<dyn Read + Send>> {
     if input.starts_with("http://") || input.starts_with("https://") {
@@ -732,9 +743,10 @@ fn open_live_input(input: &str) -> io::Result<Box<dyn Read + Send>> {
             .map_err(|e| io::Error::other(format!("HTTP GET failed: {e}")))?;
 
         if response.status().as_u16() < 200 || response.status().as_u16() >= 300 {
-            return Err(io::Error::other(
-                format!("HTTP status {}", response.status()),
-            ));
+            return Err(io::Error::other(format!(
+                "HTTP status {}",
+                response.status()
+            )));
         }
 
         Ok(Box::new(response.into_body().into_reader()))
@@ -756,6 +768,41 @@ struct LiveBuffer {
     name: String,
     carrier_sequence: Option<u8>,
     frames: VecDeque<TsmfFrame>,
+    last_header_cc: Option<u8>,
+
+    /*
+     * continuity_counter の飛びを検出した位置。
+     * 値は「ジャンプ直後のフレームの frames 内 index」。
+     * フレームの消費・破棄に合わせて drop_front_frames() で前へずらす。
+     */
+    cc_jump_positions: Vec<usize>,
+}
+
+#[derive(Debug)]
+enum LiveSyncError {
+    ContinuityJump { source_idx: usize },
+    BadFramePositions { source_idx: usize, got: Vec<u8> },
+    MissingCarriers,
+}
+
+impl std::fmt::Display for LiveSyncError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LiveSyncError::ContinuityJump { source_idx } => {
+                write!(f, "header continuity jump on source {}", source_idx)
+            }
+            LiveSyncError::BadFramePositions { source_idx, got } => {
+                write!(
+                    f,
+                    "bad frame positions on source {}: got {:?} expected [0, 1, 2, 3]",
+                    source_idx, got
+                )
+            }
+            LiveSyncError::MissingCarriers => {
+                write!(f, "missing carriers in superframe")
+            }
+        }
+    }
 }
 
 fn recv_live_frame_into_buffers(rx: &mpsc::Receiver<LiveMessage>, buffers: &mut [LiveBuffer]) {
@@ -772,7 +819,58 @@ fn recv_live_frame_into_buffers(rx: &mpsc::Receiver<LiveMessage>, buffers: &mut 
         buf.carrier_sequence = Some(msg.frame.header.carrier_sequence);
     }
 
+    note_header_continuity(buf, &msg.frame.header);
+
     buf.frames.push_back(msg.frame);
+}
+
+/*
+ * TSMFヘッダ(PID 0x2F)のcontinuity_counterはフレームごとに+1される。
+ * 飛びがあればドロップでフレームが欠けたとみなし、ジャンプ位置を記録する。
+ * 同値の繰り返し(重複パケット)はドロップ扱いにしない。
+ *
+ * cc は4bitなので、欠落が15フレーム(cc同値)や16の倍数(ccが繋がって見える)の
+ * 場合はここでは検出できない。前者は frame_position のズレで検出され、
+ * 後者は統計ベースのフォールバック再同期に任せる。
+ */
+fn note_header_continuity(buf: &mut LiveBuffer, header: &ExtendedTsmfHeader) {
+    let cc = header.continuity_counter;
+
+    if let Some(prev) = buf.last_header_cc {
+        let expected = (prev + 1) & 0x0f;
+
+        if cc != expected && cc != prev {
+            buf.cc_jump_positions.push(buf.frames.len());
+            eprintln!(
+                "live header continuity jump: source={} carrier={:?} prev_cc={} got_cc={} position={}",
+                buf.source_idx,
+                buf.carrier_sequence,
+                prev,
+                cc,
+                buf.frames.len()
+            );
+        }
+    }
+
+    buf.last_header_cc = Some(cc);
+}
+
+/*
+ * バッファ先頭から count フレーム捨て、ジャンプ位置を消費分だけ前へずらす。
+ * 捨てた範囲内のジャンプは再同期探索で吸収されるので破棄する。
+ */
+fn drop_front_frames(buf: &mut LiveBuffer, count: usize) {
+    let count = buf.frames.len().min(count);
+
+    for _ in 0..count {
+        buf.frames.pop_front();
+    }
+
+    buf.cc_jump_positions.retain(|&p| p >= count);
+
+    for p in buf.cc_jump_positions.iter_mut() {
+        *p -= count;
+    }
 }
 
 fn live_buffers_ready(buffers: &[LiveBuffer], min_fp0: usize) -> bool {
@@ -792,34 +890,65 @@ fn buffers_have_at_least_frames(buffers: &[LiveBuffer], n: usize) -> bool {
     buffers.iter().all(|b| b.frames.len() >= n)
 }
 
-fn pop_one_live_superframe(buffers: &mut [LiveBuffer]) -> Vec<Vec<TsmfFrame>> {
+/*
+ * 各バッファ先頭の4フレームが fp=0,1,2,3 で揃っていることを確認してから
+ * 1スーパーフレーム分を取り出す。ドロップでフレームが欠けてズレた場合は
+ * バッファを消費せずにエラーを返し、呼び出し側が再同期する。
+ */
+fn pop_aligned_live_superframe(
+    buffers: &mut [LiveBuffer],
+) -> Result<Vec<Vec<TsmfFrame>>, LiveSyncError> {
     let n_carriers = buffers.len();
     let n_frames = EXPECTED_NUMBER_OF_FRAMES;
+
+    /*
+     * 先頭スーパーフレームが cc ジャンプをまたぐ、またはジャンプ直後から
+     * 始まる場合は、波間で丸ごとズレている可能性があるので取り出さない。
+     */
+    for b in buffers.iter() {
+        if b.cc_jump_positions.iter().any(|&p| p < n_frames) {
+            return Err(LiveSyncError::ContinuityJump {
+                source_idx: b.source_idx,
+            });
+        }
+    }
+
+    for b in buffers.iter() {
+        let got: Vec<u8> = b
+            .frames
+            .iter()
+            .take(n_frames)
+            .map(|f| f.header.frame_position)
+            .collect();
+
+        let aligned =
+            got.len() == n_frames && got.iter().enumerate().all(|(i, &fp)| fp as usize == i);
+
+        if !aligned {
+            return Err(LiveSyncError::BadFramePositions {
+                source_idx: b.source_idx,
+                got,
+            });
+        }
+    }
 
     let mut superframe: Vec<Vec<TsmfFrame>> = (0..n_frames)
         .map(|_| Vec::with_capacity(n_carriers))
         .collect();
 
     for b in buffers.iter_mut() {
-        for _ in 0..n_frames {
+        for frames_at_fp in superframe.iter_mut() {
             let frame = b.frames.pop_front().unwrap();
-            let fp = frame.header.frame_position as usize;
+            frames_at_fp.push(frame);
+        }
 
-            if fp < n_frames {
-                superframe[fp].push(frame);
-            } else {
-                eprintln!(
-                    "live invalid frame_position={} carrier={}",
-                    frame.header.frame_position,
-                    frame.header.carrier_sequence
-                );
-            }
+        // ジャンプ位置はすべて n_frames 以上であることを確認済み
+        for p in b.cc_jump_positions.iter_mut() {
+            *p -= n_frames;
         }
     }
 
-    normalize_superframe(superframe, n_carriers).unwrap_or_else(|| {
-        panic!("live superframe normalization failed");
-    })
+    normalize_superframe(superframe, n_carriers).ok_or(LiveSyncError::MissingCarriers)
 }
 
 #[derive(Debug, Clone)]
@@ -830,7 +959,7 @@ struct LiveTrialResult {
     stats: TlvStats,
 }
 
-fn find_best_live_sync(buffers: &[LiveBuffer]) -> LiveTrialResult {
+fn try_find_best_live_sync(buffers: &[LiveBuffer]) -> Option<LiveTrialResult> {
     if buffers.len() != 3 {
         panic!("live sync search is currently 3-carrier only");
     }
@@ -842,11 +971,12 @@ fn find_best_live_sync(buffers: &[LiveBuffer]) -> LiveTrialResult {
 
     for (i, list) in fp0_lists.iter().enumerate() {
         if list.len() <= BASE_INDEX {
-            panic!(
+            eprintln!(
                 "live stream {} has too few fp0 candidates: {}",
                 i,
                 list.len()
             );
+            return None;
         }
     }
 
@@ -856,10 +986,7 @@ fn find_best_live_sync(buffers: &[LiveBuffer]) -> LiveTrialResult {
 
     eprintln!(
         "live sync search: base fp0 candidate={} carrier1 fixed, carrier2/3 shift={}..{} payload_start={}",
-        BASE_INDEX,
-        -MAX_SHIFT,
-        MAX_SHIFT,
-        PAYLOAD_START
+        BASE_INDEX, -MAX_SHIFT, MAX_SHIFT, PAYLOAD_START
     );
 
     for s2 in -MAX_SHIFT..=MAX_SHIFT {
@@ -891,7 +1018,8 @@ fn find_best_live_sync(buffers: &[LiveBuffer]) -> LiveTrialResult {
     }
 
     if results.is_empty() {
-        panic!("no live sync candidate found");
+        eprintln!("no live sync candidate found");
+        return None;
     }
 
     results.sort_by_key(|r| r.score);
@@ -904,7 +1032,7 @@ fn find_best_live_sync(buffers: &[LiveBuffer]) -> LiveTrialResult {
         );
     }
 
-    results[0].clone()
+    Some(results[0].clone())
 }
 
 fn collect_fp0_indices_from_deque(frames: &VecDeque<TsmfFrame>) -> Vec<usize> {
@@ -1033,9 +1161,7 @@ impl<R: Read> LiveFrameReader<R> {
                             self.carrier_sequence = Some(h.carrier_sequence);
                             eprintln!(
                                 "live reader source={} input={} carrier={}",
-                                self.source_idx,
-                                self.name,
-                                h.carrier_sequence
+                                self.source_idx, self.name, h.carrier_sequence
                             );
                         }
 
@@ -1162,13 +1288,7 @@ fn process_superframe_frames(
         }
     }
 
-    ordered_slots.sort_by_key(|s| {
-        (
-            s.subframe,
-            s.slot_position,
-            s.carrier_sequence,
-        )
-    });
+    ordered_slots.sort_by_key(|s| (s.subframe, s.slot_position, s.carrier_sequence));
 
     for slot in ordered_slots {
         reassembler.feed_split_tlv_packet(&slot.packet);
@@ -1674,4 +1794,186 @@ fn looks_like_valid_tlv_type(packet_type: u16) -> bool {
 
 fn read_u16_be(bytes: &[u8]) -> u16 {
     ((bytes[0] as u16) << 8) | bytes[1] as u16
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_header(carrier: u8, fp: u8, cc: u8) -> ExtendedTsmfHeader {
+        ExtendedTsmfHeader {
+            frame_pid: PID_EXTENDED_TSMF_HEADER,
+            continuity_counter: cc,
+            frame_sync: 0,
+            version_number: 0,
+            relative_stream_number_mode: true,
+            frame_type: 0,
+            stream_status: [false; 15],
+            stream_id: [0; 15],
+            original_network_id: [0; 15],
+            receive_status: [0; 15],
+            emergency_indicator: false,
+            relative_stream_number: [0; 52],
+            stream_type: [StreamKind::TsOrNone; 15],
+            group_id: 0,
+            number_of_carriers: 3,
+            carrier_sequence: carrier,
+            number_of_frames: EXPECTED_NUMBER_OF_FRAMES as u8,
+            frame_position: fp,
+            crc: 0,
+        }
+    }
+
+    fn test_frame(carrier: u8, fp: u8) -> TsmfFrame {
+        TsmfFrame {
+            header: test_header(carrier, fp, 0),
+            slots: vec![[0u8; TS_PACKET_SIZE]; DATA_SLOTS_PER_TSMF],
+        }
+    }
+
+    fn test_buffer(source_idx: usize, carrier: u8, fps: &[u8]) -> LiveBuffer {
+        LiveBuffer {
+            source_idx,
+            name: format!("test{}", source_idx),
+            carrier_sequence: Some(carrier),
+            frames: fps.iter().map(|&fp| test_frame(carrier, fp)).collect(),
+            last_header_cc: None,
+            cc_jump_positions: Vec::new(),
+        }
+    }
+
+    fn aligned_buffers() -> Vec<LiveBuffer> {
+        vec![
+            test_buffer(0, 1, &[0, 1, 2, 3]),
+            test_buffer(1, 2, &[0, 1, 2, 3]),
+            test_buffer(2, 3, &[0, 1, 2, 3]),
+        ]
+    }
+
+    #[test]
+    fn pop_aligned_live_superframe_pops_in_fp_order() {
+        let mut buffers = aligned_buffers();
+
+        let superframe = pop_aligned_live_superframe(&mut buffers).unwrap();
+
+        assert_eq!(superframe.len(), EXPECTED_NUMBER_OF_FRAMES);
+
+        for (fp, frames) in superframe.iter().enumerate() {
+            assert_eq!(frames.len(), 3);
+            for f in frames {
+                assert_eq!(f.header.frame_position as usize, fp);
+            }
+        }
+
+        assert!(buffers.iter().all(|b| b.frames.is_empty()));
+    }
+
+    #[test]
+    fn pop_aligned_live_superframe_detects_dropped_frame() {
+        let mut buffers = aligned_buffers();
+        // carrier 1 の fp=2 フレームがドロップで欠けたケース
+        buffers[0] = test_buffer(0, 1, &[0, 1, 3, 0]);
+
+        let err = pop_aligned_live_superframe(&mut buffers).unwrap_err();
+
+        assert!(matches!(
+            err,
+            LiveSyncError::BadFramePositions { source_idx: 0, .. }
+        ));
+
+        // 検出時はバッファを消費しない
+        assert_eq!(buffers[0].frames.len(), 4);
+        assert_eq!(buffers[1].frames.len(), 4);
+    }
+
+    #[test]
+    fn pop_aligned_live_superframe_detects_misaligned_start() {
+        let mut buffers = aligned_buffers();
+        buffers[2] = test_buffer(2, 3, &[1, 2, 3, 0]);
+
+        let err = pop_aligned_live_superframe(&mut buffers).unwrap_err();
+
+        assert!(matches!(
+            err,
+            LiveSyncError::BadFramePositions { source_idx: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn pop_aligned_live_superframe_detects_continuity_jump_at_front() {
+        let mut buffers = aligned_buffers();
+        // 先頭スーパーフレーム内(0..4)にジャンプがある
+        buffers[1].cc_jump_positions.push(2);
+
+        let err = pop_aligned_live_superframe(&mut buffers).unwrap_err();
+
+        assert!(matches!(
+            err,
+            LiveSyncError::ContinuityJump { source_idx: 1 }
+        ));
+
+        // 検出時はバッファを消費しない
+        assert_eq!(buffers[1].frames.len(), 4);
+    }
+
+    #[test]
+    fn pop_aligned_live_superframe_keeps_future_continuity_jump() {
+        let mut buffers: Vec<LiveBuffer> = vec![
+            test_buffer(0, 1, &[0, 1, 2, 3, 0, 1, 2, 3]),
+            test_buffer(1, 2, &[0, 1, 2, 3, 0, 1, 2, 3]),
+            test_buffer(2, 3, &[0, 1, 2, 3, 0, 1, 2, 3]),
+        ];
+        // 2スーパーフレーム目の先頭(index 4)の直前にジャンプ =
+        // 4フレーム丸ごと欠落で fp の並びだけでは検出できないケース
+        buffers[1].cc_jump_positions.push(4);
+
+        // 1スーパーフレーム目はジャンプより前なので取り出せる
+        pop_aligned_live_superframe(&mut buffers).unwrap();
+
+        // 消費に合わせて位置が前へずれ、次の pop で検出される
+        assert_eq!(buffers[1].cc_jump_positions, vec![0]);
+
+        let err = pop_aligned_live_superframe(&mut buffers).unwrap_err();
+
+        assert!(matches!(
+            err,
+            LiveSyncError::ContinuityJump { source_idx: 1 }
+        ));
+    }
+
+    #[test]
+    fn drop_front_frames_discards_passed_jump_positions() {
+        let mut buf = test_buffer(0, 1, &[0, 1, 3, 0, 1, 2, 3]);
+        buf.cc_jump_positions = vec![2, 6];
+
+        drop_front_frames(&mut buf, 3);
+
+        assert_eq!(buf.frames.len(), 4);
+        // 捨てた範囲(0..3)内のジャンプは破棄され、残りは前へずれる
+        assert_eq!(buf.cc_jump_positions, vec![3]);
+    }
+
+    #[test]
+    fn continuity_jump_records_buffer_position() {
+        let mut buf = test_buffer(0, 1, &[0, 1]);
+
+        note_header_continuity(&mut buf, &test_header(1, 0, 5));
+        note_header_continuity(&mut buf, &test_header(1, 1, 6));
+        assert!(buf.cc_jump_positions.is_empty());
+
+        // cc が 6 -> 8 に飛んだ = 間のフレームが落ちた。
+        // 次に push される frame の位置 (= 現在の frames.len()) が記録される
+        note_header_continuity(&mut buf, &test_header(1, 2, 8));
+        assert_eq!(buf.cc_jump_positions, vec![2]);
+    }
+
+    #[test]
+    fn continuity_counter_wraps_without_false_positive() {
+        let mut buf = test_buffer(0, 1, &[]);
+
+        note_header_continuity(&mut buf, &test_header(1, 0, 15));
+        note_header_continuity(&mut buf, &test_header(1, 1, 0));
+
+        assert!(buf.cc_jump_positions.is_empty());
+    }
 }
